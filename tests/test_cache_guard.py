@@ -80,9 +80,20 @@ rc, out, _ = sl("p", model=OPUS, prompt_cache=pc(**COLD))
 check("statusline: cold shows list-price cost when the model is known", "re-reads ~180k (~$1.44)" in out, out)
 
 # ---------------- cold-message guard
+sl("p0", model=OPUS, prompt_cache=pc(**COLD))
+rc, out, _ = run(["hook-prompt"], {"session_id": "p0", "prompt": "continue", "source": "user"})
+j = json.loads(out) if out.strip() else {}
+check("cold message: by default a typed prompt is warned, never stopped", rc == 0 and "decision" not in j
+      and all(s in j.get("systemMessage", "") for s in ("180k", "$1.44", "cold 10m ago", "/clear")), out)
+rc, out, _ = run(["hook-prompt"], {"session_id": "p0", "prompt": "continue", "source": "user"})
+check("cold message: by default warns once per cold spell", rc == 0 and out.strip() == "", out)
+
+cfg_path = HOME / ".claude" / "cache-guard" / "config.json"
+cfg_path.parent.mkdir(parents=True, exist_ok=True)
+cfg_path.write_text(json.dumps({"cold_prompt": "block"}))  # stopping a message is opt-in
 rc, out, _ = run(["hook-prompt"], {"session_id": "p", "prompt": "fix the bug", "source": "user"})
 j = json.loads(out) if out.strip() else {}
-check("cold message: typed prompt blocked once with size, cost and age",
+check("cold message: cold_prompt=block stops a typed prompt once with size, cost and age",
       j.get("decision") == "block" and all(s in j.get("reason", "") for s in ("180k", "$1.44", "cold 10m ago", "/clear"))
       and "additionalContext" not in out, out)
 rc, out, _ = run(["hook-prompt"], {"session_id": "p", "prompt": "fix the bug", "source": "user"})
@@ -114,7 +125,6 @@ check("cold message: caching off is silent", rc == 0 and out.strip() == "", out)
 rc, out, _ = run(["hook-prompt"], {"session_id": "never-seen", "prompt": "hello", "source": "user"})
 check("cold message: no status-line data is silent", rc == 0 and out.strip() == "", out)
 
-cfg_path = HOME / ".claude" / "cache-guard" / "config.json"
 for mode, want in (("warn", "systemMessage"), ("off", "")):
     sid = f"p-{mode}"
     sl(sid, model=OPUS, prompt_cache=pc(**COLD))
@@ -604,16 +614,26 @@ check("install: v1 hook upgraded in place", len(h["PreModelSwitch"]) == 1 and "h
 check("install: compact/session/trim hooks", "hook-compact" in json.dumps(h["PreCompact"]) and "hook-session-start" in json.dumps(h["SessionStart"])
       and "hook-trim" in json.dumps(h["PostToolUse"]), json.dumps(h))
 check("install: cold-message hook", "hook-prompt" in json.dumps(h["UserPromptSubmit"]), json.dumps(h))
-check("install: config gets the new defaults", json.loads(cfg_path.read_text()).get("cold_prompt") == "block", cfg_path.read_text())
+check("install: config gets the new defaults", json.loads(cfg_path.read_text()).get("cold_prompt") == "warn"
+      and json.loads(cfg_path.read_text()).get("statusline_cost") is True, cfg_path.read_text())
 check("install: user hooks preserved", h["Stop"][0]["hooks"][0]["command"] == "echo done" and any("inject.sh" in json.dumps(g) for g in h["PostToolUse"]), json.dumps(h))
 check("install: style copied", (HOME / ".claude" / "output-styles" / "lean.md").exists())
 check("install: backup written", any(p.name.startswith("settings.json.bak-") for p in settings.parent.iterdir()))
+c = json.loads(cfg_path.read_text())
+c["cold_prompt"] = "block"
+cfg_path.write_text(json.dumps(c))
 rc, out, err = run(["install"])
 check("install: re-run keeps trimmer, no duplicates", sum("hook-trim" in json.dumps(g) for g in json.loads(settings.read_text())["hooks"]["PostToolUse"]) == 1)
+check("install: re-run keeps a cold_prompt you set", json.loads(cfg_path.read_text()).get("cold_prompt") == "block", cfg_path.read_text())
 rc, out, err = run(["install", "--no-trim", "--lean"])
 s = json.loads(settings.read_text())
 check("install: --no-trim removes only ours, --lean sets style", "hook-trim" not in json.dumps(s["hooks"].get("PostToolUse", []))
       and "inject.sh" in json.dumps(s["hooks"]["PostToolUse"]) and s.get("outputStyle") == "Lean", json.dumps(s))
+rc, out, err = run(["install", "--all"])
+s = json.loads(settings.read_text())
+check("install: --all turns on alerts and Lean, never the trimmer", rc == 0
+      and "hook-trim" not in json.dumps(s["hooks"].get("PostToolUse", [])) and "Bash output trimmer (off; add --trim)" in out
+      and s.get("outputStyle") == "Lean" and json.loads(cfg_path.read_text()).get("notify") is True, out + json.dumps(s))
 
 rc, out, err = run(["doctor"])
 check("doctor: runs", rc == 0, out + err)

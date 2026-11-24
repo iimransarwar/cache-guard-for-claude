@@ -8,7 +8,8 @@ Needs Python 3.8+ and Claude Code v2.1.251 or later (v2.1.260+ for miss causes).
 
 ```bash
 python3 cache_guard.py install          # status line + safety hooks + Lean style file
-python3 cache_guard.py install --all    # also: Bash output trimmer, expiry alerts, Lean as default
+python3 cache_guard.py install --all    # also: expiry alerts, Lean as default
+python3 cache_guard.py install --trim   # also: Bash output trimmer (only ever on when asked for by name)
 ```
 
 Then restart Claude Code and run:
@@ -17,14 +18,14 @@ Then restart Claude Code and run:
 python3 ~/.claude/cache-guard/cache_guard.py doctor
 ```
 
-Install backs up `~/.claude/settings.json` first, keeps your own hooks, and replaces any existing status line. That status line is kept in the backup. Re-running install is safe.
+Install backs up `~/.claude/settings.json` first, keeps your own hooks, and replaces any existing status line. That status line is kept in the backup. Re-running install is safe. It keeps the trimmer if it is already on, even from an earlier `--all`; `--no-trim` removes it.
 
 | Flag | What it adds |
 | - | - |
 | `--trim` | Trims huge Bash output (test and build logs) before Claude reads it |
 | `--notify` | Desktop alert when a warm cache is about to expire |
 | `--lean` | Makes the bundled Lean output style your default |
-| `--all` | All three |
+| `--all` | `--notify` and `--lean`. It never turns on the trimmer: only `--trim` does |
 | `--no-trim`, `--no-notify` | Turn those back off |
 
 ## What you get
@@ -59,7 +60,7 @@ The tip is the most urgent of these:
 | - | - |
 | Model switch | When the cache is warm, asks first and shows how many tokens the switch re-reads. When it's cold, stays silent. |
 | `/compact` | When the cache is cold, a manual `/compact` is stopped once with the cost. Run it again within 2 minutes to go ahead. Auto-compaction is never touched. |
-| Cold message | When you type into a session whose cache has gone cold and whose history is over 100k tokens, the message is stopped once. You see how long the cache has been cold, how many tokens the message re-reads and what that costs at list price. Send it again within 2 minutes to go ahead, or `/clear` first for a new task. Slash commands, loops, scheduled tasks and SDK prompts are never stopped. |
+| Cold message | When you type into a session whose cache has gone cold and whose history is over 100k tokens, you get a warning: how long the cache has been cold, how many tokens the message re-reads and what that costs at list price. For a new task, `/clear` first is far cheaper. The message itself goes through. Set `cold_prompt` to `block` to have it stopped once instead; you then send it again within 2 minutes to go ahead. Slash commands, loops, scheduled tasks and SDK prompts are never touched. |
 | Resume | Warns when a resume re-sends a big history after the cache has expired. |
 | Bash trimmer (opt-in) | Output over 12,000 chars keeps its first 30 lines, last 60 lines and every error or warning line. The full log is saved to `~/.claude/cache-guard/logs/` and Claude is told where. Add `# no-trim` to a command to skip trimming. |
 
@@ -94,7 +95,7 @@ Costs use API list prices built into the script. On a subscription they show rel
 
 ## Settings
 
-Thresholds live in `~/.claude/cache-guard/config.json`:
+Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to it and keeps the values already there. A config.json written by an earlier install says `"cold_prompt": "block"`; change it to `"warn"` to get the current default.
 
 | Key | Default | Meaning |
 | - | - | - |
@@ -105,9 +106,9 @@ Thresholds live in `~/.claude/cache-guard/config.json`:
 | `limit_warn_pct` | 80 | Usage-limit warning threshold |
 | `resume_warn_tokens` | 50000 | Minimum history size for the resume warning |
 | `compact_confirm_seconds` | 120 | Window to confirm a cold `/compact` |
-| `cold_prompt` | block | Cold-message guard: `block` stops the message once, `warn` only tells you, `off` disables it |
+| `cold_prompt` | warn | Cold-message guard: `warn` only tells you, `block` stops the message once, `off` disables it |
 | `cold_prompt_warn_tokens` | 100000 | Smallest history the cold-message guard acts on |
-| `cold_prompt_confirm_seconds` | 120 | Window to send a stopped message again |
+| `cold_prompt_confirm_seconds` | 120 | With `block`, the window to send a stopped message again |
 | `pricing` | {} | Price overrides, per million tokens: `{"model-id-prefix": [input, 5m write, 1h write, cache read, output]}` |
 | `statusline_cost` | true | Show session cost, avoidable cost and cache savings on the status line |
 | `avoidable_warn_pct` | 15 | Avoidable share of the session's cost (%) at which that figure turns yellow |
@@ -126,7 +127,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ## Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 95 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 99 checks against a throwaway HOME
 ```
 
 ## Caveats
@@ -136,5 +137,5 @@ python3 tests/test_cache_guard.py   # 95 checks against a throwaway HOME
 - If your Claude Code version doesn't let hooks stop `/compact`, you'll see the warning and it will compact anyway.
 - Causes in `report` are inferred from timing, model changes and markers in the transcript. `/usage` shows Claude Code's own diagnosis.
 - Prices are list prices from November 2026 and will go stale. Models without a price are counted in tokens and left out of cost. Fix either with `pricing` in the config.
-- The cold-message guard relies on the status line having run in that session, and on Claude Code saying who sent the prompt. If your version doesn't say, the guard warns instead of stopping.
+- The cold-message guard relies on the status line having run in that session. With `cold_prompt` set to `block`, it also relies on Claude Code saying who sent the prompt. If your version doesn't say, the guard warns instead of stopping.
 - The subagent cache-length verdict prices writes and pauses inside a subagent. It can't tell whether a longer cache would have warmed subagents that started cold.

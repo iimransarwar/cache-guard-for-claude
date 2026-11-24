@@ -15,15 +15,16 @@ Commands
                         --trim     also trim huge Bash output before Claude reads it (opt-in)
                         --notify   desktop alert when a warm cache is about to expire
                         --lean     make the bundled "Lean" output style your default
-                        --all      all three
+                        --all      --notify and --lean (never the trimmer: ask for that with --trim)
                         --no-trim / --no-notify   turn those back off
   uninstall           Remove cache-guard from settings.json.
 
 Hook entry points (wired by install; you never call these yourself)
   hook-model-switch   PreModelSwitch: ask before a switch that throws away a warm cache.
   hook-compact        PreCompact: a manual /compact on a COLD cache must be repeated to run.
-  hook-prompt         UserPromptSubmit: a typed message into a big COLD session is stopped once,
-                      with what it will cost. Automated prompts are never touched.
+  hook-prompt         UserPromptSubmit: a typed message into a big COLD session gets a warning with
+                      what it will cost (stopped once instead with cold_prompt=block). Automated
+                      prompts are never touched.
   hook-session-start  SessionStart: warn when a resume re-sends a big, expired history.
   hook-trim           PostToolUse (Bash): trim huge output, keep errors, save the full log.
 
@@ -62,7 +63,7 @@ DEFAULT_CONFIG = {
     "limit_warn_pct": 80,        # 5-hour / 7-day usage warning threshold
     "resume_warn_tokens": 50000, # warn on resume when re-sending more than this, uncached
     "compact_confirm_seconds": 120,
-    "cold_prompt": "block",      # block = stop a cold message once; warn = only tell you; off
+    "cold_prompt": "warn",       # warn = only tell you; block = stop a cold message once; off
     "cold_prompt_warn_tokens": 100000,  # only when the message would re-read at least this much
     "cold_prompt_confirm_seconds": 120,
     "pricing": {},               # override or add list prices: {"model-id-prefix": [in, 5m, 1h, read, out]}
@@ -476,10 +477,10 @@ def hook_compact():
 
 
 def hook_prompt():
-    """Stop a typed message into a big cold session once, and say what it will cost."""
+    """Tell the user what a typed message into a big cold session will cost; with cold_prompt=block, stop it once."""
     data = read_stdin_json()
     cfg = load_config()
-    mode = str(cfg.get("cold_prompt", "block")).lower()
+    mode = str(cfg.get("cold_prompt", "warn")).lower()
     source = data.get("source")
     if mode == "off" or source not in (None, "user"):
         return  # loops, scheduled tasks, SDK and system turns are never touched
@@ -1481,8 +1482,8 @@ def cmd_install(flags):
     had_trim = any(SCRIPT_NAME in (h.get("command") or "")
                    for g in ((existing.get("hooks") or {}).get("PostToolUse") or [])
                    for h in g.get("hooks", []))
-    # re-running install keeps the trimmer if it was on, unless you pass --no-trim
-    trim = (want_all or "--trim" in flags or had_trim) and "--no-trim" not in flags
+    # only --trim turns the trimmer on (never --all); re-running install keeps it if it was on, unless --no-trim
+    trim = ("--trim" in flags or had_trim) and "--no-trim" not in flags
     want_notify = want_all or "--notify" in flags
     lean = want_all or "--lean" in flags
 
