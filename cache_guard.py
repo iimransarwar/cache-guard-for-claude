@@ -280,10 +280,68 @@ def context_pct(data):
     return None
 
 
-def limit_pct(data, window):
-    w = ((data.get("rate_limits") or {}).get(window)) or {}
-    pct = w.get("used_percentage")
-    return (float(pct), w.get("resets_at")) if isinstance(pct, (int, float)) else (None, None)
+LIMIT_WINDOWS = (("five_hour", "5h", "5-hour"), ("seven_day", "week", "weekly"))  # key, on the line, in the tip
+SPEND_PERIODS = {"daily": ("day", "daily"), "weekly": ("week", "weekly"), "monthly": ("month", "monthly")}
+
+
+def usage_limits(data):
+    """Every usage limit Claude Code passed, in display order: limits for one model first, then all models, then a
+    gateway spend limit. five_hour and seven_day cover all models. Any other key with a used_percentage is shown too,
+    named from its key: seven_day_<name> as that model's weekly limit, five_hour_<name> as its 5-hour one."""
+    rl = data.get("rate_limits")
+    found = []
+    for key, w in (rl.items() if isinstance(rl, dict) else ()):
+        used = w.get("used_percentage") if isinstance(w, dict) else None
+        if isinstance(used, bool) or not isinstance(used, (int, float)):
+            continue
+        short = words = None
+        if key == "spend_limit":
+            scope, group = "Spend limit", 2
+            short, words = SPEND_PERIODS.get(str(w.get("period")), (None, None))
+        else:
+            rest = str(key)
+            for prefix, s, wd in LIMIT_WINDOWS:
+                if rest == prefix or rest.startswith(prefix + "_"):
+                    short, words, rest = s, wd, rest[len(prefix) + 1:]
+                    break
+            name = rest.replace("_", " ").strip().title()
+            scope, group = (name, 0) if name else ("All models", 1)
+        found.append({"scope": scope, "group": group, "short": short, "words": words, "used": float(used),
+                      "left": min(100.0, max(0.0, 100.0 - float(used))), "reset": w.get("resets_at")})
+    first = {}
+    for x in found:
+        first.setdefault(x["scope"], len(first))
+    windows = {"5h": 0, "week": 1}
+    return sorted(found, key=lambda x: (x["group"], first[x["scope"]], windows.get(x["short"], 2)))
+
+
+def limits_text(limits, cfg):
+    """'Fable: 61% left · All models: 58% left (5h) · 82% left (week)', coloured by how much is used."""
+    scopes = {}
+    for x in limits:
+        scopes.setdefault(x["scope"], []).append(x)
+    parts = []
+    for scope, items in scopes.items():
+        bits = []
+        for x in items:
+            colour = RED if x["used"] >= 90 else YEL if x["used"] >= cfg["limit_warn_pct"] else ""
+            window = f" ({x['short']})" if len(items) > 1 and x["short"] else ""
+            bits.append(f"{colour}{x['left']:.0f}% left{window}{RST if colour else ''}")
+        parts.append(f"{scope}: {' · '.join(bits)}")
+    return " · ".join(parts)
+
+
+def limit_name(x):
+    """'Weekly Fable limit', '5-hour limit for all models', 'Monthly spend limit'."""
+    words = x["words"] or ""
+    if x["scope"] == "All models":
+        name = f"{words} limit for all models"
+    elif x["scope"] == "Spend limit":
+        name = f"{words} spend limit"
+    else:
+        name = f"{words} {x['scope']} limit"
+    name = name.strip()
+    return name[0].upper() + name[1:]
 
 
 def emit(obj):
@@ -321,14 +379,8 @@ def cmd_statusline():
     state = load_state(sid)
     rotating = TIPS[int(now // 60) % len(TIPS)]
 
-    fh, fh_reset = limit_pct(data, "five_hour")
-    sd, sd_reset = limit_pct(data, "seven_day")
-    limits = []
-    for label, pct in (("5h", fh), ("7d", sd)):
-        if pct is not None:
-            colour = RED if pct >= 90 else YEL if pct >= cfg["limit_warn_pct"] else ""
-            limits.append(f"{colour}{label} {pct:.0f}%{RST if colour else ''}")
-    limits_txt = f" | {' '.join(limits)}" if limits else ""
+    limits = usage_limits(data)
+    limits_txt = f" | {limits_text(limits, cfg)}" if limits else ""
 
     if data.get("transcript_path"):
         state["transcript_path"] = data["transcript_path"]
@@ -390,11 +442,8 @@ def cmd_statusline():
     causes = ((pc.get("last_miss_cause") or {}).get("causes")) or []
     recent_miss = now - float(state.get("miss_seen_at", 0)) < cfg["cause_tip_seconds"]
     cpct = context_pct(data)
-    hot_limit = None
-    for label, p, reset in (("5-hour", fh, fh_reset), ("7-day", sd, sd_reset)):
-        if p is not None and p >= cfg["limit_warn_pct"]:
-            hot_limit = (label, p, reset)
-            break
+    hot = [x for x in limits if x["used"] >= cfg["limit_warn_pct"]]
+    hot_limit = max(hot, key=lambda x: x["used"]) if hot else None  # the one nearest to used up
 
     if not warm and pc.get("caching_observed", True):
         if int(now // 30) % 2 == 0:
@@ -406,10 +455,10 @@ def cmd_statusline():
     elif mins_left is not None and mins_left < cfg["expiry_warn_minutes"]:
         tip = f"{YEL}Cache expires in {mins_left + 1}m.{RST} Reply soon or the next turn rebuilds it."
     elif hot_limit:
-        label, p, reset = hot_limit
-        when = f" (resets {fmt_clock(reset)})" if reset else ""
-        tip = (f"{YEL}{label} limit at {p:.0f}%{when}.{RST} Avoid resumes, model switches "
-               f"and cold /compact until then.")
+        left = f"{hot_limit['left']:.0f}"
+        when = f" (resets {fmt_clock(hot_limit['reset'])})" if hot_limit["reset"] else ""
+        tip = (f"{YEL}{limit_name(hot_limit)} {'used up' if left == '0' else 'nearly used up'}: {left}% left{when}.{RST} "
+               f"Avoid resumes, model switches and cold /compact until then.")
     elif recent_miss and causes:
         c = causes[0]
         if c in CAUSE_TIPS:

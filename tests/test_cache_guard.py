@@ -21,10 +21,10 @@ NOW = int(time.time())
 failures = 0
 
 
-def run(args, payload=None, cwd=WORK):
+def run(args, payload=None, cwd=WORK, raw=False):
     p = subprocess.run([sys.executable, str(SCRIPT), *args], input=json.dumps(payload) if payload is not None else "",
                        capture_output=True, text=True, env=ENV, cwd=cwd)
-    return p.returncode, ANSI.sub("", p.stdout), ANSI.sub("", p.stderr)
+    return p.returncode, (p.stdout if raw else ANSI.sub("", p.stdout)), ANSI.sub("", p.stderr)
 
 
 def check(name, cond, detail=""):
@@ -42,10 +42,10 @@ def pc(**kw):
     return base
 
 
-def sl(sid, **extra):
+def sl(sid, raw=False, **extra):
     d = {"session_id": sid, "model": {"display_name": "Opus 5.5"}}
     d.update(extra)
-    return run(["statusline"], d)
+    return run(["statusline"], d, raw=raw)
 
 
 # ---------------- status line
@@ -54,7 +54,8 @@ check("statusline: before first response", rc == 0 and "waiting for first respon
 
 rc, out, _ = sl("a", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 42, "resets_at": NOW + 3600},
                                                        "seven_day": {"used_percentage": 18, "resets_at": NOW + 86400}})
-check("statusline: warm with limits", "cache 95%" in out and "warm, 39m left" in out and "5h 42%" in out and "7d 18%" in out, out)
+check("statusline: warm with limits", "cache 95%" in out and "warm, 39m left" in out
+      and out.splitlines()[0].endswith("| misses 0 | All models: 58% left (5h) · 82% left (week)") and "5h 42%" not in out, out)
 
 rc, out, _ = sl("a", prompt_cache=pc(misses=1, last_miss_cause={"causes": ["tools_changed"]}))
 check("statusline: new miss shows cause tip", "tool definitions changed" in out, out)
@@ -63,7 +64,39 @@ rc, out, _ = sl("b", prompt_cache=pc(ttl="5m", expires_at=NOW + 100))
 check("statusline: expiring warning", "Cache expires in 2m" in out, out)
 
 rc, out, _ = sl("c", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 86, "resets_at": NOW + 3600}})
-check("statusline: usage-limit tip", "5-hour limit at 86%" in out and "resets" in out, out)
+check("statusline: usage-limit tip", "5-hour limit for all models nearly used up: 14% left (resets " in out, out)
+
+# usage limits, as percent left and named for whom they apply to
+R = NOW + 3600
+rc, out, _ = sl("lim-1", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 42, "resets_at": R}})
+check("limits: one all-models limit reads as percent left", out.splitlines()[0].endswith("| misses 0 | All models: 58% left"), out)
+rc, out, _ = sl("lim-2", prompt_cache=pc(), rate_limits={"seven_day": {"used_percentage": 18, "resets_at": R},
+                                                         "seven_day_fable": {"used_percentage": 39, "resets_at": R}})
+check("limits: a model's own limit comes first, named after the model, with its own value",
+      out.splitlines()[0].endswith("| misses 0 | Fable: 61% left · All models: 82% left"), out)
+rc, out, _ = sl("lim-3", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 42, "resets_at": R},
+                                                         "seven_day": {"used_percentage": 18, "resets_at": R},
+                                                         "seven_day_fable": {"used_percentage": 39, "resets_at": R}})
+check("limits: both windows of one scope say which is which",
+      out.splitlines()[0].endswith("| Fable: 61% left · All models: 58% left (5h) · 82% left (week)"), out)
+rc, out, _ = sl("lim-4", prompt_cache=pc(), rate_limits={"seven_day": {"used_percentage": 18, "resets_at": R},
+                                                         "weekend_burst": {"used_percentage": 25, "resets_at": R},
+                                                         "five_hour_opus": {"used_percentage": 10}, "note": "x",
+                                                         "odd": {"resets_at": R}, "flag": {"used_percentage": True}})
+check("limits: unknown limit keys of the same shape are shown, named from the key",
+      out.splitlines()[0].endswith("| misses 0 | Weekend Burst: 75% left · Opus: 90% left · All models: 82% left"), out)
+for sid, rl in (("lim-5", None), ("lim-5b", {}), ("lim-5c", {"five_hour": None})):
+    rc, out, _ = sl(sid, prompt_cache=pc(), **({} if rl is None else {"rate_limits": rl}))
+    check(f"limits: no limit data leaves the block out ({sid})", rc == 0 and out.splitlines()[0].endswith("| misses 0"), out)
+rc, out, _ = sl("lim-6", prompt_cache=pc(), rate_limits={"spend_limit": {
+    "used_percentage": 112.4, "resets_at": R, "used_usd": 562, "limit_usd": 500, "period": "monthly"}})
+check("limits: a gateway spend limit never shows below 0% left", out.splitlines()[0].endswith("| Spend limit: 0% left")
+      and "Monthly spend limit used up: 0% left (resets " in out, out)
+rc, out, _ = sl("lim-7", raw=True, prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 85, "resets_at": R},
+                                                                   "seven_day_fable": {"used_percentage": 91, "resets_at": R + 86400}})
+check("limits: colours follow how much is used", "Fable: \x1b[31m9% left\x1b[0m" in out
+      and "All models: \x1b[33m15% left\x1b[0m" in out, repr(out))
+check("limits: the tip names the limit nearest to used up", "Weekly Fable limit nearly used up: 9% left (resets " in out, out)
 
 rc, out, _ = sl("d", prompt_cache=pc(), context_window={"used_percentage": 82})
 check("statusline: context-full tip", "Context 82% full" in out, out)

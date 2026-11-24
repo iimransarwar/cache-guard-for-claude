@@ -33,7 +33,7 @@ Install backs up `~/.claude/settings.json` first, keeps your own hooks, and repl
 **Status line** (two lines, refreshes every 30s)
 
 ```
-Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cost $12.40 · avoidable $1.90 · saved $48.10 | misses 1 | 5h 42% 7d 18%
+Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cost $12.40 · avoidable $1.90 · saved $48.10 | misses 1 | All models: 58% left (5h) · 82% left (week)
 tip: Last miss: tool definitions changed. Leave MCP servers and plugins alone until a break.
 ```
 
@@ -45,11 +45,15 @@ The three money figures are for the current session at API list prices. On a sub
 
 Requests on models without a price are left out of all three, as in `report`. If nothing in the session can be priced, the block is left out. The status line keeps running totals in its state file and reads only what the transcripts gained since the last refresh. It spends at most half a second reading per refresh. If a refresh runs out of time (the first one on a very large session, for example), it shows the last figures it had, or none yet, and carries on at the next refresh. An error leaves the block out, never the line. Turn it off with `statusline_cost`.
 
+Usage limits show as percent left, named for whom they apply to. When a limit has both a 5-hour and a weekly window, each says which it is, as in `All models: 58% left (5h) · 82% left (week)`. A limit for a single model comes first, under that model's name, for example `Fable: 61% left`. Behind a Claude apps gateway, a spend limit shows as `Spend limit: 37% left`. Any other limit Claude Code passes in the same shape is shown too, named from its key (`seven_day_fable` would read as the weekly Fable limit). A limit turns yellow at `limit_warn_pct` used (default 80%) and red at 90% used. With no limit data, on an API key for example, this part is left out.
+
+Claude Code's status line documentation lists only the 5-hour and weekly windows for all models (`rate_limits.five_hour`, `rate_limits.seven_day`) and the gateway `spend_limit`. A model's own weekly limit, such as Fable's, shows in `/usage` but is not passed to status lines, so it appears here only once Claude Code passes it.
+
 The tip is the most urgent of these:
 
 1. Cache is cold: suggests `/clear` for new work, and points out that now is a free moment to switch model or MCP servers.
 2. Cache about to expire: reply soon.
-3. 5-hour or 7-day usage limit above 80%: avoid expensive actions until it resets.
+3. A usage limit over 80% used: names the limit, says how much is left and when it resets, and suggests avoiding expensive actions until then.
 4. The cause of a miss in the last 10 minutes.
 5. Context above 75%: `/compact` at your next break.
 6. Otherwise, a rotating tip from 24 do's and don'ts.
@@ -103,7 +107,7 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `notify_minutes` | 3 | How early to alert |
 | `expiry_warn_minutes` | 3 | When the status line warns about expiry |
 | `context_warn_pct` | 75 | When to suggest `/compact` |
-| `limit_warn_pct` | 80 | Usage-limit warning threshold |
+| `limit_warn_pct` | 80 | Share of a usage limit used (%) at which it turns yellow and the tip warns (red from 90%) |
 | `resume_warn_tokens` | 50000 | Minimum history size for the resume warning |
 | `compact_confirm_seconds` | 120 | Window to confirm a cold `/compact` |
 | `cold_prompt` | warn | Cold-message guard: `warn` only tells you, `block` stops the message once, `off` disables it |
@@ -127,7 +131,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ## Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 99 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 109 checks against a throwaway HOME
 ```
 
 ## Caveats
