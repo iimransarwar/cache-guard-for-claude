@@ -32,7 +32,8 @@ Hook entry points (wired by install; you never call these yourself)
                       before the cache expires, as long as that costs less than a rebuild.
 
 Design rule: hooks only ever show messages to YOU (systemMessage / stderr).
-They never inject text into Claude's context, so they can't break the cache themselves.
+They never inject text into Claude's context, so they can't break the cache themselves. The one exception is opt-in
+keep-warm, whose ping is a message to Claude asking for a one-word reply.
 
 Needs Python 3.8+ and Claude Code v2.1.251+ (v2.1.260+ for miss causes). No dependencies.
 """
@@ -47,7 +48,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 GUARD_DIR = CLAUDE_DIR / "cache-guard"
@@ -648,7 +649,10 @@ KEEPWARM_POLL = 30.0          # seconds between checks while waiting
 KEEPWARM_ALIVE = 120          # the status line ran this recently: the session is still open
 KEEPWARM_OWN_TURN = 90        # a prompt this soon after a ping is the ping's own turn, not the user coming back
 KEEPWARM_PING_TOKENS = (200, 20)  # rough tokens a ping adds to the cache, and its reply
-KEEPWARM_MSG = ("cache-guard keep-warm ping (automatic: the user is away and this only keeps the prompt cache warm). "
+KEEPWARM_SETTLE = 10.0        # transcript writes this soon after a turn ends belong to that turn
+KEEPWARM_DEFAULT_ALLOWANCE = {"1h": 20, "5m": 12}  # models without a price: as if reads cost a tenth of input
+KEEPWARM_MARK = "cache-guard keep-warm ping"
+KEEPWARM_MSG = (KEEPWARM_MARK + " (automatic: the user is away and this only keeps the prompt cache warm). "
                 "Reply with only: ok. Do not use tools and do not continue any task.")
 
 
@@ -681,14 +685,14 @@ def keepwarm_lead(ttl, cfg):
         lead = float(cfg.get("keepwarm_lead_minutes", 5)) * 60 if ttl == "1h" else 60.0
     except Exception:
         lead = 300.0
-    return float(min(max(lead, 0.0), secs * 0.95))
+    return float(min(max(lead, min(30.0, secs * 0.5)), secs * 0.95))  # a floor, or the ping lands on a cold cache
 
 
 def keepwarm_allowance(cfg, model_id, tokens, ttl):
-    """How many pings together cost less than one rebuild of `tokens`; None when the model has no price."""
+    """How many pings together cost less than one rebuild of `tokens`; a conservative default for unpriced models."""
     p = price_for(price_table(cfg), model_id, int(tokens))
     if not p:
-        return None
+        return KEEPWARM_DEFAULT_ALLOWANCE.get(ttl, 12)
     write = p[2] if ttl == "1h" else p[1]
     ping = int(tokens) * p[3] + KEEPWARM_PING_TOKENS[0] * write + KEEPWARM_PING_TOKENS[1] * p[4]
     return int(int(tokens) * write // ping) if ping > 0 else None
@@ -704,7 +708,8 @@ def hook_keepwarm():
     sid = data.get("session_id")
     if not keepwarm_on(cfg) or not sid:
         return
-    ttl = load_state(sid).get("ttl")
+    st = load_state(sid)
+    ttl = st.get("ttl")
     if ttl not in TTL_SECONDS:
         return  # the status line hasn't seen this session's cache yet
     armed, token = time.time(), os.urandom(6).hex()
@@ -713,34 +718,69 @@ def hook_keepwarm():
         kw.update(keepwarm_pings=0, keepwarm_since=armed)  # the user was here since the last ping: a new stretch
     kw["keepwarm_armed"] = token
     save_keepwarm(sid, kw)
-    expiry = armed + TTL_SECONDS[ttl]
-    target = expiry - keepwarm_lead(ttl, cfg)
+    ttl_secs, lead, transcript = TTL_SECONDS[ttl], keepwarm_lead(ttl, cfg), st.get("transcript_path")
+    baseline = []
+
+    def expiry():
+        """When the turn ended plus the TTL, or Claude Code's own expiry when that is earlier (the last cache hit was
+        when the final request started, which on a long reply is well before the turn ended)."""
+        e = armed + ttl_secs
+        try:
+            x = float(load_state(sid).get("expires_at"))
+            if armed < x < e:
+                e = x
+        except Exception:
+            pass
+        return e
 
     def stood_down():
+        """A newer turn re-armed, any turn started (typed, loop, scheduled), the transcript grew (a turn with no
+        prompt), or the session closed (the status line stopped refreshing)."""
         k = load_keepwarm(sid)
-        return k.get("keepwarm_armed") != token or float(k.get("last_prompt_at") or 0) > armed
+        if (k.get("keepwarm_armed") != token or float(k.get("last_prompt_at") or 0) > armed
+                or float(k.get("turn_at") or 0) > armed):
+            return True
+        if time.time() - float(load_state(sid).get("updated") or 0) > KEEPWARM_ALIVE:
+            return True
+        if transcript and time.time() - armed >= KEEPWARM_SETTLE:
+            try:
+                size = os.path.getsize(transcript)
+            except OSError:
+                return False
+            if not baseline:
+                baseline.append(size)
+            elif size != baseline[0]:
+                return True
+        return False
 
-    while time.time() < target:  # wall clock, so a Mac that slept is noticed
-        time.sleep(max(0.0, min(KEEPWARM_POLL, target - time.time())))
+    while time.time() < expiry() - lead:  # wall clock, so a Mac that slept is noticed
+        time.sleep(max(0.0, min(KEEPWARM_POLL, expiry() - lead - time.time())))
         if stood_down() or not keepwarm_on(load_config()):
             return
     now = time.time()
-    st, kw = load_state(sid), load_keepwarm(sid)
-    if stood_down() or now >= expiry or now - float(st.get("updated") or 0) > KEEPWARM_ALIVE:
-        return  # newer turn, user back, already cold, or the session is closed
+    if stood_down() or now >= expiry():
+        return  # newer turn, user back, session closed, or the cache already went cold
+    st = load_state(sid)
     tokens, model = st.get("recache_tokens_if_cold"), st.get("model_id")
     if not tokens:
         return
     usd, _ = cold_cost(cfg, model, tokens, ttl)
     if not over_cold_floor(cfg, tokens, usd):
         return
-    pings = int(kw.get("keepwarm_pings") or 0)
+    try:
+        max_hours = float(cfg.get("keepwarm_max_hours", 12))
+    except Exception:
+        max_hours = 12.0
     allowed = keepwarm_allowance(cfg, model, tokens, ttl)
-    if allowed is not None and pings >= allowed:
+    per_day = min(allowed, int(max_hours * 3600 // max(ttl_secs - lead, 60.0)) + 1)
+    kw = load_keepwarm(sid)  # fresh, so a prompt that just arrived isn't lost
+    log = [x for x in kw.get("keepwarm_ping_log") or [] if isinstance(x, (int, float)) and now - x < 86400]
+    pings = int(kw.get("keepwarm_pings") or 0)
+    if pings >= allowed or len(log) >= per_day:
+        return  # more would cost more than the rebuild it saves; the 24-hour log holds even if stretches reset
+    if now - float(kw.get("keepwarm_since") or armed) > max_hours * 3600:
         return
-    if now - float(kw.get("keepwarm_since") or armed) > float(cfg.get("keepwarm_max_hours", 12)) * 3600:
-        return
-    kw.update(keepwarm_pings=pings + 1, keepwarm_fired_at=now)
+    kw.update(keepwarm_pings=pings + 1, keepwarm_fired_at=now, keepwarm_ping_log=log + [now])
     save_keepwarm(sid, kw)
     sys.stderr.write(KEEPWARM_MSG + "\n")
     sys.exit(2)
@@ -834,17 +874,21 @@ def hook_prompt():
     data = read_stdin_json()
     cfg = load_config()
     source = data.get("source")
-    if source not in (None, "user"):
-        return  # loops, scheduled tasks, SDK and system turns are never touched
     sid = data.get("session_id")
     state = load_state(sid)
     if not state:
         return
     now = time.time()
     kw = load_keepwarm(sid)
-    if kw and now - float(kw.get("keepwarm_fired_at") or 0) > KEEPWARM_OWN_TURN:
-        kw["last_prompt_at"] = now  # the user is here: any keep-warm timer stands down
+    if kw:  # any new turn stands a waiting keep-warm timer down; only the user coming back starts a new stretch
+        kw["turn_at"] = now
+        ping_turn = KEEPWARM_MARK in str(data.get("prompt") or "") or (
+            source is None and now - float(kw.get("keepwarm_fired_at") or 0) <= KEEPWARM_OWN_TURN)
+        if source == "user" or (source is None and not ping_turn):
+            kw["last_prompt_at"] = now
         save_keepwarm(sid, kw)
+    if source not in (None, "user"):
+        return  # loops, scheduled tasks, SDK and system turns are never warned about
     if str(data.get("prompt") or "").lstrip().startswith("/"):
         return  # /clear and /compact are the way out, so never stand in front of a command
     before = json.dumps(state, sort_keys=True)
@@ -2229,6 +2273,9 @@ def cmd_install(flags):
     print("  ✓ hooks: model-switch guard, cold /compact guard, cold-message guard, resume warning")
     print(f"  {'✓' if trim else '·'} Bash output trimmer {'' if trim else '(off; add --trim)'}")
     print(f"  {'✓' if keepwarm else '·'} keep-warm while you're away {'' if keepwarm else '(off; add --keepwarm)'}")
+    others = [h for g in hooks.get("Stop", []) for h in g.get("hooks", []) if SCRIPT_NAME not in (h.get("command") or "")]
+    if keepwarm and others:
+        print(f"    note: each keep-warm ping is a full turn, so your {len(others)} other Stop hooks run after it too")
     print(f"  {'✓' if want_notify or cfg.get('notify') else '·'} expiry notifications "
           f"{'' if want_notify or cfg.get('notify') else '(off; add --notify)'}")
     print(f"  ✓ Lean output style saved to {STYLE_DIR / 'lean.md'}"
@@ -2258,6 +2305,10 @@ def cmd_uninstall():
         settings.pop("hooks", None)
     if settings.get("outputStyle") == "Lean":
         settings.pop("outputStyle")
+    cfg = read_json(CONFIG_PATH) if CONFIG_PATH.exists() else None
+    if isinstance(cfg, dict) and cfg.get("keepwarm"):
+        cfg["keepwarm"] = False  # sessions still running the old hook stop pinging
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
     SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
     print(f"Removed cache-guard from {SETTINGS} (backup: {backup}).")
     print(f"To delete the files too: rm -rf {GUARD_DIR} {STYLE_DIR / 'lean.md'}")

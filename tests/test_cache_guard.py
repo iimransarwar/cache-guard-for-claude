@@ -309,7 +309,7 @@ check("budget: with a cold cache too, one message carries both", out.count("syst
 cfg_path.unlink()
 
 # ---------------- keep-warm
-KW_CONSTS = json.dumps({"TTL_SECONDS": {"1h": 4.0, "5m": 4.0}, "KEEPWARM_POLL": 0.05})
+KW_CONSTS = json.dumps({"TTL_SECONDS": {"1h": 4.0, "5m": 4.0}, "KEEPWARM_POLL": 0.05, "KEEPWARM_SETTLE": 0.2})
 KW_STATE = HOME / ".claude" / "cache-guard" / "state"
 
 
@@ -345,9 +345,9 @@ def kw_wait(p_):
 
 LEAD = ("import sys, json; sys.path.insert(0, sys.argv[1]); import cache_guard as cg; c = cg.load_config(); "
         "print(json.dumps([cg.keepwarm_lead('1h', c), cg.keepwarm_lead('5m', c), "
-        "cg.keepwarm_lead('1h', dict(c, keepwarm_lead_minutes=57))]))")
+        "cg.keepwarm_lead('1h', dict(c, keepwarm_lead_minutes=57)), cg.keepwarm_lead('1h', dict(c, keepwarm_lead_minutes=0))]))")
 got = subprocess.run([sys.executable, "-B", "-c", LEAD, str(ROOT)], capture_output=True, text=True, env=ENV).stdout
-check("keepwarm: pings 5 minutes early on a 1h cache, 1 minute on a 5m cache", got.strip() == "[300.0, 60.0, 3420.0]", got)
+check("keepwarm: pings 5 minutes early on a 1h cache, 1 minute on a 5m cache", got.strip() == "[300.0, 60.0, 3420.0, 30.0]", got)
 
 kw_state("kw0")
 t0 = time.time()
@@ -409,6 +409,45 @@ kw_state("kw11", keepwarm_fired_at=time.time() - 5, last_prompt_at=t - 3600)
 run(["hook-prompt"], {"session_id": "kw11", "prompt": "ok"})
 check("keepwarm: the ping's own turn doesn't count as you coming back", kw_get("kw11").get("last_prompt_at") == t - 3600,
       json.dumps(kw_get("kw11")))
+kw_state("kw13")
+p_ = kw_start("kw13")
+time.sleep(0.6)
+run(["hook-prompt"], {"session_id": "kw13", "prompt": "tick", "source": "loop_wakeup"})
+rc, out, err = kw_wait(p_)
+check("keepwarm: any new turn stands the timer down, a loop's too", rc == 0 and not err.strip(), f"{rc} {err}")
+t = time.time()
+kw_state("kw14", keepwarm_fired_at=t - 5, last_prompt_at=t - 3600, keepwarm_since=t - 3600)
+p_ = kw_start("kw14")
+time.sleep(0.6)
+run(["hook-prompt"], {"session_id": "kw14", "prompt": "carry on", "source": "user"})
+rc, out, err = kw_wait(p_)
+check("keepwarm: a typed message right after a ping still stands it down", rc == 0 and not err.strip(), f"{rc} {err}")
+tp = WORK / "kw15.jsonl"
+tp.write_text("{}\n")
+kw_state("kw15", transcript_path=str(tp))
+p_ = kw_start("kw15")
+time.sleep(0.8)
+with open(tp, "a") as f:
+    f.write("{}\n")
+rc, out, err = kw_wait(p_)
+check("keepwarm: a turn that writes the transcript without a prompt stands it down", rc == 0 and not err.strip(), f"{rc} {err}")
+kw_state("kw16", expires_at=time.time() + 1.6)
+t0 = time.time()
+rc, out, err = kw_wait(kw_start("kw16"))
+check("keepwarm: uses Claude Code's own expiry when it is earlier", rc == 2 and time.time() - t0 < 2.2, f"{rc} {err}")
+t = time.time()
+kw_state("kw17", model_id="us.anthropic.claude-mystery-9", keepwarm_pings=20, keepwarm_fired_at=t - 5,
+         last_prompt_at=t - 3600, keepwarm_since=t - 3600)
+rc, out, err = kw_wait(kw_start("kw17"))
+check("keepwarm: a model without a price gets a conservative cap", rc == 0 and not err.strip(), f"{rc} {err}")
+kw_state("kw18", keepwarm_fired_at=t - 600, last_prompt_at=t - 3600)
+run(["hook-prompt"], {"session_id": "kw18", "prompt": "cache-guard keep-warm ping (automatic)"})
+check("keepwarm: the ping's own prompt, by its text, never counts as you coming back",
+      kw_get("kw18").get("last_prompt_at") == t - 3600, json.dumps(kw_get("kw18")))
+kw_state("kw19", keepwarm_ping_log=[t - 600 * i for i in range(1, 39)], last_prompt_at=t - 10)
+rc, out, err = kw_wait(kw_start("kw19"))
+check("keepwarm: a hard cap over 24 hours holds even if every ping looked like a new stretch", rc == 0
+      and not err.strip(), f"{rc} {err}")
 kw_state("kw12", keepwarm_pings=3, keepwarm_fired_at=time.time() - 5, last_prompt_at=t - 3600)
 rc, out, err = sl("kw12", prompt_cache=pc())
 check("keepwarm: the status line shows how many times it kept the cache warm", "kept warm ×3" in out.splitlines()[0], out)
@@ -1173,6 +1212,7 @@ rc, out, err = run(["install", "--keepwarm"])
 s = json.loads(settings.read_text())
 kh = [h for g in s["hooks"].get("Stop", []) for h in g["hooks"] if "hook-keepwarm" in h["command"]]
 check("install: --keepwarm wires a background Stop hook that can wake Claude", rc == 0 and len(kh) == 1
+      and "other Stop hooks" in out
       and kh[0].get("async") is True and kh[0].get("asyncRewake") is True and kh[0].get("timeout", 0) >= 43200
       and json.loads(cfg_path.read_text()).get("keepwarm") is True and "keep-warm" in out, out + json.dumps(s["hooks"]))
 rc, out, err = run(["install"])
@@ -1231,7 +1271,10 @@ rc, out, err = run(["doctor"], cwd=WORK)
 check("doctor: a clean environment has no interceptor or secret warnings", rc == 0 and "preloads code" not in out
       and "looks like" not in out and "local proxy" not in out, out)
 
+run(["install", "--keepwarm"])
 rc, out, err = run(["uninstall"])
+check("uninstall: turns keep-warm off for sessions still running the old hook",
+      json.loads(cfg_path.read_text()).get("keepwarm") is False, cfg_path.read_text())
 s = json.loads(settings.read_text())
 check("uninstall: removes ours, keeps user's", "cache_guard" not in json.dumps(s) and "echo done" in json.dumps(s)
       and "inject.sh" in json.dumps(s) and "outputStyle" not in s, json.dumps(s))
