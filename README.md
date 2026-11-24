@@ -6,7 +6,7 @@ Every turn, Claude Code re-sends your whole conversation. Prompt caching bills t
 
 cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 166](https://img.shields.io/badge/tests-166%20checks-2ea44f)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 174](https://img.shields.io/badge/tests-174%20checks-2ea44f)
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 42% left (5h, out in ~40m) · 82% left (week)
@@ -20,10 +20,10 @@ tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before 
 
 - **See the money, live.** `cache cut $60.50 → $12.40` is what this session would have cost without the cache, then what it did cost. `avoidable $1.90` is what was spent rebuilding a cache that should have been read.
 - **Every project at a glance.** A second line adds up the last 30 days across every project and names the three where caching saved the most. It's refreshed in the background, so the status line never slows down.
-- **Know before you hit the wall.** A pace forecast measures how fast your usage limit is rising right now and says `out in ~40m` when you'd run out before the reset. Idle hours never skew it, and it stays silent when you're fine.
-- **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache shows the cost and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task.
+- **Know before you hit the wall.** A pace forecast measures how fast your 5-hour limit is rising right now and says `out in ~40m` when you'd run out before the reset. Idle hours never skew it, and it stays silent when you're fine.
+- **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache says how much it would re-read and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task.
 - **A budget, if you want one.** Set `session_budget_usd` and you're told when a session, subagents included, passes it, and again at each multiple. Or have the message stopped once.
-- **A doctor for your setup.** It finds settings that silently break caching, adds up everything loaded into every session, flags API keys and passwords sitting in CLAUDE.md or memory files, and spots proxies that rewrite your requests.
+- **A doctor for your setup.** It finds settings that silently break caching, adds up the CLAUDE.md files, imports, memory and rules loaded into every session, flags API keys and passwords sitting in them, and spots proxies that can rewrite your requests.
 - **Reports that explain the bill.** `report` lists every real cache miss with its likely cause and cost. `report --all` splits 30 days of spend by cause and subagents, and tells you whether a 5-minute or 1-hour subagent cache would have been cheaper on your own history.
 
 ## Why not a proxy, a keep-warm bot or a usage bar?
@@ -35,7 +35,7 @@ There are other ways to attack the same problem. Each one gives up something cac
 | Sits between Claude Code and Anthropic | **No** | Yes, every request | No | No |
 | Sends requests that use your quota | **Never** | No | Yes, every ping | Some poll usage APIs |
 | Touches your Claude login token | **Never** | Every request passes through it | No | Some read it from your keychain |
-| Can change what Claude sees | **Never** (only the opt-in trimmer shortens huge output) | Yes | Some add turns | No |
+| Can change what Claude sees | **Only what you opt into** (Bash trimmer, Lean style) | Yes | Some add turns | No |
 | Warns before cache-breaking moves | **Yes: model switch, cold `/compact`, cold message, resume** | No | Some, before a cold message | No |
 | Explains misses and their cost | **Yes, per miss and per cause** | Partly | No | Partly |
 | Forecasts running out of quota | **Yes, from the recent pace** | No | No | Some, from window averages |
@@ -45,9 +45,9 @@ There are other ways to attack the same problem. Each one gives up something cac
 
 - **No network.** cache-guard never makes a request. Everything comes from what Claude Code passes to the status line and the transcripts already on your disk.
 - **No proxy, no token.** It never sits in front of your API traffic and never reads your login credentials.
-- **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The one exception is the Bash trimmer, which is off unless you ask for it by name and only shortens huge command output.
+- **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, and the Lean output style changes how Claude writes its replies.
 - **Your settings, backed up.** Install backs up `settings.json`, keeps your own hooks, and uninstalls in one command.
-- **Readable.** One file, standard library only, with a 166-check test suite that runs against a throwaway home folder.
+- **Readable.** One file, standard library only, with a 174-check test suite that runs against a throwaway home folder.
 
 ## Install
 
@@ -104,7 +104,7 @@ Requests on models without a price are left out of every figure, as in `report`.
 
 Usage limits show as percent left, named for whom they apply to. When a limit has both a 5-hour and a weekly window, each says which it is, as in `All models: 58% left (5h) · 82% left (week)`. A limit for a single model comes first, under that model's name, for example `Fable: 61% left`. Behind a Claude apps gateway, a spend limit shows as `Spend limit: 37% left`. Any other limit Claude Code passes in the same shape is shown too, named from its key (`seven_day_fable` would read as the weekly Fable limit). A limit turns yellow at `limit_warn_pct` used (default 80%) and red at 90% used. With no limit data, on an API key for example, this part is left out.
 
-**Pace forecast**: "58% left" doesn't tell you whether you'll make it to the reset. cache-guard keeps a reading of each limit every minute and measures how fast it is rising over the last `pace_window_minutes` (default 30). When that pace uses a limit up before it resets, the limit says so, as in `42% left (5h, out in ~40m)`, and the tip says how long before the reset you'd be locked out. It needs at least 5 minutes of readings and a 1-point rise, so a single reading or an idle stretch never raises a false alarm, and a new reset time starts the readings over. Turn it off with `pace_forecast`.
+**Pace forecast**: "58% left" doesn't tell you whether you'll make it to the reset. cache-guard keeps a reading of each limit every minute and measures how fast it is rising over the last `pace_window_minutes` (default 30). When that pace uses a limit up before it resets, the limit says so, as in `42% left (5h, out in ~40m)`, and the tip says how long before the reset you'd be locked out. Only 5-hour windows are forecast: a weekly limit isn't used around the clock, so its recent pace would cry wolf. It needs at least 5 minutes of readings and a 1-point rise, so a single reading or an idle stretch never raises a false alarm. A new reset time starts the readings over, and a lower reading from another, idle session is ignored. Turn it off with `pace_forecast`.
 
 Claude Code's status line documentation lists only the 5-hour and weekly windows for all models (`rate_limits.five_hour`, `rate_limits.seven_day`) and the gateway `spend_limit`. A model's own weekly limit, such as Fable's, shows in `/usage` but is not passed to status lines, so it appears here only once Claude Code passes it.
 
@@ -125,7 +125,7 @@ The tip is the most urgent of these:
 | Model switch | When the cache is warm, asks first and shows how many tokens the switch re-reads. When it's cold, stays silent. |
 | `/compact` | When the cache is cold, a manual `/compact` is stopped once with the cost. Run it again within 2 minutes to go ahead. Auto-compaction is never touched. |
 | Cold message | When you type into a session whose cache has gone cold and whose history would cost at least `cold_prompt_warn_usd` ($0.50) to re-read, you get a warning. The floor is in dollars because 100k tokens costs very different amounts on Haiku and Opus; models without a price fall back to `cold_prompt_warn_tokens` (100k). The warning says how long the cache has been cold, how many tokens the message re-reads and what that costs at list price. For a new task, `/clear` first is far cheaper. The message itself goes through. Set `cold_prompt` to `block` to have it stopped once instead; you then send it again within 2 minutes to go ahead. Slash commands, loops, scheduled tasks and SDK prompts are never touched. |
-| Session budget (opt-in) | Set `session_budget_usd` and typed messages get a warning when the session's list-price cost (main conversation plus subagents) passes it, and again at 2×, 3× and so on. The status line adds `over $25 budget` in red. Set `session_budget_action` to `block` to have the message stopped once instead; send it again within 2 minutes to go ahead. If the cache is also cold, both warnings arrive as one message. |
+| Session budget (opt-in) | Set `session_budget_usd` and typed messages get a warning when the session's list-price cost (main conversation plus subagents) passes it, and again at 2×, 3× and so on. The status line adds `over $25 budget` in red. Set `session_budget_action` to `block` to have the message stopped once instead; send it again within 2 minutes to go ahead. If the cache is also cold, both warnings arrive as one message. It keeps working with `statusline_cost` off. |
 | Resume | Warns when a resume re-sends a big history after the cache has expired. |
 | Bash trimmer (opt-in) | Output over 12,000 chars keeps its first 30 lines, last 60 lines and every error or warning line. The full log is saved to `~/.claude/cache-guard/logs/` and Claude is told where. Add `# no-trim` to a command to skip trimming. |
 
@@ -141,8 +141,8 @@ Scans for settings that silently break the cache, waste tokens or leak secrets:
 - a gateway that may strip cache markers
 - other hooks that inject `additionalContext` on every tool call
 - everything loaded into every session, added up: CLAUDE.md files here and in parent folders, their `@imports`, this folder's auto-memory `MEMORY.md`, and rules without a `paths:` scope. Over 15k tokens is flagged.
-- secrets in those files and in memory files (API keys, tokens, private keys, `password=` lines), by file and line. The value itself is never printed.
-- request interceptors: `NODE_OPTIONS` preloading code, `HTTPS_PROXY` with its own certificate, or `ANTHROPIC_BASE_URL` on localhost. They can rewrite TTLs and cache markers, so the figures you see may not be what Anthropic billed.
+- secrets in those files and in memory files (API keys, tokens, private keys, `password=` lines), by file and line. The value itself is never printed, and references such as `${VAR}` or `process.env.X` are not flagged.
+- request interceptors: `NODE_OPTIONS` preloading code, `HTTPS_PROXY` with its own certificate, or `ANTHROPIC_BASE_URL` on localhost. They can rewrite TTLs and cache markers, so the figures you see may not be what Anthropic billed. Proxy and base URLs are printed with any password hidden.
 - missing output caps
 
 ### `report`
@@ -175,7 +175,7 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `expiry_warn_minutes` | 3 | When the status line warns about expiry |
 | `context_warn_pct` | 75 | When to suggest `/compact` |
 | `limit_warn_pct` | 80 | Share of a usage limit used (%) at which it turns yellow and the tip warns (red from 90%) |
-| `pace_forecast` | true | Say when the recent pace uses a limit up before it resets |
+| `pace_forecast` | true | Say when the recent pace uses a 5-hour limit up before it resets |
 | `pace_window_minutes` | 30 | How far back the pace is measured |
 | `resume_warn_tokens` | 50000 | Minimum history size for the resume warning |
 | `compact_confirm_seconds` | 120 | Window to confirm a cold `/compact` |
@@ -207,7 +207,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ### Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 166 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 174 checks against a throwaway HOME
 ```
 
 ### Caveats

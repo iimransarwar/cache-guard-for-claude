@@ -155,6 +155,24 @@ cfg_path_p.write_text(json.dumps({"pace_forecast": False}))
 rc, out, err = pace_sl("pace-7", 60, [[NOW - 1200, 40.0]])
 check("pace: pace_forecast=false turns it off", rc == 0 and "out in" not in out and "At this pace" not in out, out)
 cfg_path_p.unlink()
+rc, out, err = pace_sl("pace-9", 100, [[NOW - 1200, 80.0]])
+check("pace: a limit already used up gets no forecast", "0% left" in out and "out in" not in out
+      and "At this pace" not in out, out)
+PACE.write_text(json.dumps({"All models|5h": {"reset": R5, "samples": [[NOW - 1200, 40.0], [NOW - 60, 52.0]]}}))
+rc, out, err = sl("pace-10", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 45, "resets_at": R5}})
+kept = json.loads(PACE.read_text())["All models|5h"]["samples"]
+check("pace: a lower, stale reading from another session is ignored", "out in" not in out and kept[-1][1] == 52.0
+      and len(kept) == 2, out + PACE.read_text())
+rc, out, err = sl("pace-11", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 30,
+                                                                             "resets_at": R5 - 18000}})
+kept = json.loads(PACE.read_text())["All models|5h"]
+check("pace: an older reset time from an idle session doesn't wipe the readings", kept["reset"] == R5
+      and len(kept["samples"]) == 2, PACE.read_text())
+PACE.write_text(json.dumps({"All models|week": {"reset": NOW + 5 * 86400, "samples": [[NOW - 1700, 20.5]]}}))
+rc, out, err = sl("pace-12", prompt_cache=pc(), rate_limits={"seven_day": {"used_percentage": 22,
+                                                                             "resets_at": NOW + 5 * 86400}})
+check("pace: only 5-hour windows are forecast (a week isn't used around the clock)", "78% left" in out
+      and "out in" not in out, out)
 PACE.write_text("{junk")
 rc, out, err = sl("pace-8", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 60, "resets_at": R5}})
 check("pace: a corrupt pace.json never breaks the line", rc == 0 and "40% left" in out and not err, out + err)
@@ -728,6 +746,11 @@ rc, out, _ = cost_sl("cost-1", p1)
 check("budget: the status line says when the session is over budget", "· over $0.01 budget |" in out.splitlines()[0], out)
 cfg_path.unlink()
 
+cfg_path.write_text(json.dumps({"statusline_cost": False, "session_budget_usd": 0.01}))
+rc, out, _ = cost_sl("cost-bud", p1)
+rc2, out2, _ = run(["hook-prompt"], {"session_id": "cost-bud", "prompt": "next", "source": "user"})
+check("budget: still guards when the cost display is off", "cost $" not in out.splitlines()[0]
+      and "$0.01 budget" in out2, out + out2)
 cfg_path.write_text(json.dumps({"statusline_cost": False}))
 rc, out, _ = cost_sl("cost-1", p1)
 st = json.loads((STATE / "cost-1.json").read_text())
@@ -1060,6 +1083,18 @@ check("doctor: flags secrets by file and line without printing them",
 check("doctor: flags request interceptors", all(x in out for x in (
     "NODE_OPTIONS preloads code into Claude Code", "proxy that holds its own certificate",
     "ANTHROPIC_BASE_URL=http://localhost:9801 points at a local proxy")), out)
+(W2 / ".claude" / "rules" / "body.md").write_text("---\ndescription: x\n---\npaths: are mentioned here\ntoken "
+                                                   "ghp_" + "Z9" * 18 + "\n")
+(W2 / "CLAUDE.local.md").write_text("DB password: ${DB_PASSWORD}\napiKey: process.env.OPENAI_API_KEY\n"
+                                    "Run `pwd: /Users/x/proj` first\nsecret = os.environ['APP_SECRET_VALUE']\n")
+env_p = {**ENV, "HTTPS_PROXY": "http://jdoe:S3cretPassw0rd@proxy.example:8080", "NODE_EXTRA_CA_CERTS": "/x/ca.pem",
+         "ANTHROPIC_BASE_URL": "http://bob:Hunter2Hunter2@localhost:9801"}
+rc, out, err = run(["doctor"], cwd=W2, env=env_p)
+check("doctor: never prints a password in a proxy or base URL", rc == 0 and "S3cretPassw0rd" not in out
+      and "Hunter2Hunter2" not in out and "proxy.example:8080" in out and "localhost:9801" in out, out)
+check("doctor: a paths: line in a rule's body doesn't scope it", f"{W2 / '.claude' / 'rules' / 'body.md'}:5 looks like a "
+      "GitHub token" in out, out)
+check("doctor: references to env vars are not secrets", f"{W2 / 'CLAUDE.local.md'}:" not in out, out)
 rc, out, err = run(["doctor"], cwd=WORK)
 check("doctor: a clean environment has no interceptor or secret warnings", rc == 0 and "preloads code" not in out
       and "looks like" not in out and "local proxy" not in out, out)

@@ -361,19 +361,26 @@ def pace_forecast(limits, cfg, now):
         data = read_json(PACE_PATH) if PACE_PATH.exists() else None
         data = data if isinstance(data, dict) else {}
         for x in limits:
+            if x["short"] != "5h":
+                continue  # a weekly limit isn't used around the clock, so its recent pace would cry wolf
             k, reset = pace_key(x), x["reset"]
-            e = data.get(k)
+            e = data.get(k) if isinstance(data.get(k), dict) else {}
             try:
-                same = isinstance(e, dict) and (e.get("reset") == reset or abs(float(e["reset"]) - float(reset)) < 60)
+                shift = float(reset) - float(e["reset"])
             except Exception:
-                same = False
+                shift = 0.0 if e and reset == e.get("reset") else None
+            if shift is not None and shift < -60:
+                continue  # an idle session still passing the previous window's reading
+            same = shift is not None and abs(shift) < 60
             samples = [r for r in (e.get("samples") or []) if isinstance(r, list) and len(r) == 2
                        and now - float(r[0]) <= window] if same else []
+            if samples and x["used"] < float(samples[-1][1]):
+                continue  # lower than the newest reading: stale, from a session that hasn't refreshed
             if not samples or now - float(samples[-1][0]) >= 60 or float(samples[-1][1]) != x["used"]:
                 samples.append([now, x["used"]])
             data[k] = {"reset": reset, "samples": samples[-200:]}
             span, rise = now - float(samples[0][0]), x["used"] - float(samples[0][1])
-            if reset and span >= PACE_MIN_SPAN and rise >= PACE_MIN_RISE:
+            if reset and x["left"] > 0 and span >= PACE_MIN_SPAN and rise >= PACE_MIN_RISE:
                 secs = x["left"] / (rise / span)
                 if now + secs < float(reset):
                     out[k] = secs
@@ -868,6 +875,7 @@ def read_json(path):
 
 
 IMPORT_RE = re.compile(r"(?<![\w`/])@((?:~|\.{1,2})?/?[\w.\-/]+\.[A-Za-z0-9]+)")
+NOT_A_REFERENCE = r"(?!\$|\{\{|<|%|process\.env|os\.environ|os\.getenv|getenv|env\.|ENV\[)"  # ${VAR} etc. aren't secrets
 SECRET_PATTERNS = [  # first match per line wins; values are never printed
     ("an Anthropic API key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
     ("an API key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}")),
@@ -875,10 +883,15 @@ SECRET_PATTERNS = [  # first match per line wins; values are never printed
     ("a GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}")),
     ("a Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
     ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
-    ("a password", re.compile(r"(?i)\b(?:password|passwd|pwd)\b\s*[:=]\s*['\"]?[^\s'\"]{8,}")),
+    ("a password", re.compile(r"(?i)\b(?:password|passwd)\b\s*[:=]\s*['\"]?" + NOT_A_REFERENCE + r"[^\s'\"]{8,}")),
     ("a secret or token", re.compile(r"(?i)\b(?:secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\b"
-                                     r"\s*[:=]\s*['\"]?[^\s'\"]{12,}")),
+                                     r"\s*[:=]\s*['\"]?" + NOT_A_REFERENCE + r"[^\s'\"]{12,}")),
 ]
+
+
+def mask_url(url):
+    """http://user:pass@host → http://***@host, so doctor output can be pasted safely."""
+    return re.sub(r"(//)[^/@\s]*@", r"\1***@", str(url))
 
 
 def always_loaded(cwd):
@@ -895,7 +908,8 @@ def always_loaded(cwd):
             text = path.read_text(errors="ignore")
         except Exception:
             return
-        if kind == "rules" and re.match(r"---\s*\n(?:.*\n)*?paths\s*:", text):
+        front = re.match(r"---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", text, re.S)
+        if kind == "rules" and front and re.search(r"(?m)^paths\s*:", front.group(1)):
             return  # scoped to matching files: loaded only when Claude touches them
         sizes[kind] += len(text) // 4
         files.append((path, text))
@@ -979,13 +993,13 @@ def cmd_doctor():
         warns.append(f"NODE_OPTIONS preloads code into Claude Code ({node_opts[:60]}). Request rewriters loaded this way "
                      "can change cache TTLs and markers, so what reaches Anthropic may not be what cache-guard reports.")
     if proxy and env.get("NODE_EXTRA_CA_CERTS"):
-        warns.append(f"HTTPS_PROXY={proxy} with NODE_EXTRA_CA_CERTS: Claude Code's traffic goes through a proxy that holds "
+        warns.append(f"HTTPS_PROXY={mask_url(proxy)} with NODE_EXTRA_CA_CERTS: Claude Code's traffic goes through a proxy that holds "
                      "its own certificate. It can read and rewrite every request, your conversation included.")
     if re.search(r"//(localhost|127\.|\[::1\]|0\.0\.0\.0)", base):
-        warns.append(f"ANTHROPIC_BASE_URL={base} points at a local proxy. If it rewrites requests (TTLs, cache markers, "
+        warns.append(f"ANTHROPIC_BASE_URL={mask_url(base)} points at a local proxy. If it rewrites requests (TTLs, cache markers, "
                      "system prompt), cache-guard's figures describe what Claude Code sent, not what Anthropic billed.")
     elif base and "api.anthropic.com" not in base:
-        notes.append(f"ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']}: make sure the gateway forwards "
+        notes.append(f"ANTHROPIC_BASE_URL={mask_url(base)}: make sure the gateway forwards "
                      "cache_control markers and the anthropic-beta header, or caching silently stops.")
 
     # hooks that inject context
@@ -1742,7 +1756,8 @@ def cost_block(cfg, state):
     """' | cost $x · avoidable $y · saved $z' for the first status line, or '' when it is turned off, nothing can be
     priced yet, or anything at all goes wrong: the status line must always print."""
     on = cfg.get("statusline_cost", True)
-    if on is False or str(on).strip().lower() in ("false", "0", "off", "no", "none"):
+    shown = not (on is False or str(on).strip().lower() in ("false", "0", "off", "no", "none"))
+    if not shown and not session_budget(cfg):
         state.pop("costs", None)
         return ""
     try:
@@ -1751,6 +1766,8 @@ def cost_block(cfg, state):
     except Exception:
         state.pop("costs", None)  # start afresh next run
         return ""
+    if not shown:
+        return ""  # still counted, so the session budget keeps working
     try:
         if not figs:
             return ""
