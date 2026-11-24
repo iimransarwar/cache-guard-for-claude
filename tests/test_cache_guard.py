@@ -168,6 +168,74 @@ for mode, want in (("warn", "systemMessage"), ("off", "")):
     check(f"cold message: cold_prompt={mode}", "decision" not in out and (want in out if want else out.strip() == ""), out)
 cfg_path.unlink()
 
+# dollar threshold
+HAIKU = {"display_name": "Haiku 5.5", "id": "claude-haiku-5-5"}
+sl("p5", model=HAIKU, prompt_cache=pc(**COLD))
+rc, out, _ = run(["hook-prompt"], {"session_id": "p5", "prompt": "hello", "source": "user"})
+check("cold message: on a priced model the floor is dollars, so a cheap Haiku re-read is silent", rc == 0 and out.strip() == "",
+      out)
+sl("p6", model=OPUS, prompt_cache=pc(**COLD, recache_tokens_if_cold=80000))
+rc, out, _ = run(["hook-prompt"], {"session_id": "p6", "prompt": "hello", "source": "user"})
+check("cold message: an 80k Opus re-read costs over $0.50, so it warns", "$0.64" in out and "80k" in out, out)
+sl("p7", model={"display_name": "Mystery", "id": "claude-mystery-1"}, prompt_cache=pc(**COLD))
+rc, out, _ = run(["hook-prompt"], {"session_id": "p7", "prompt": "hello", "source": "user"})
+check("cold message: an unpriced model falls back to the token floor", "180k" in out, out)
+cfg_path.write_text(json.dumps({"cold_prompt_warn_usd": 0}))
+sl("p8", model=HAIKU, prompt_cache=pc(**COLD))
+rc, out, _ = run(["hook-prompt"], {"session_id": "p8", "prompt": "hello", "source": "user"})
+check("cold message: cold_prompt_warn_usd=0 uses the token floor only", "180k" in out, out)
+cfg_path.unlink()
+
+
+# session budget
+def with_cost(sid, cost):
+    path = HOME / ".claude" / "cache-guard" / "state" / f"{sid}.json"
+    st = json.loads(path.read_text()) if path.exists() else {}
+    st["costs"] = {"shown": {"cost": cost, "avoidable": 0.0, "saved": 1.0}}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(st))
+
+
+with_cost("b1", 30.0)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b1", "prompt": "next", "source": "user"})
+check("budget: off by default", rc == 0 and out.strip() == "", out)
+cfg_path.write_text(json.dumps({"session_budget_usd": 25}))
+rc, out, _ = run(["hook-prompt"], {"session_id": "b1", "prompt": "next", "source": "user"})
+j = json.loads(out) if out.strip() else {}
+check("budget: passing it warns with the cost", "decision" not in j
+      and all(x in j.get("systemMessage", "") for x in ("$30.00", "$25 budget")), out)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b1", "prompt": "next", "source": "user"})
+check("budget: once per budget passed", rc == 0 and out.strip() == "", out)
+with_cost("b1", 52.0)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b1", "prompt": "next", "source": "user"})
+msg = (json.loads(out) if out.strip() else {}).get("systemMessage", "")
+check("budget: again at twice the budget", "$52.00" in msg and "past 2× your $25 budget" in msg, out)
+with_cost("b1", 80.0)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b1", "prompt": "/compact", "source": "user"})
+check("budget: slash commands never touched", rc == 0 and out.strip() == "", out)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b1", "prompt": "tick", "source": "loop_wakeup"})
+check("budget: automated prompts never touched", rc == 0 and out.strip() == "", out)
+
+cfg_path.write_text(json.dumps({"session_budget_usd": 25, "session_budget_action": "block"}))
+with_cost("b2", 30.0)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b2", "prompt": "next", "source": "user"})
+j = json.loads(out) if out.strip() else {}
+check("budget: session_budget_action=block stops it once", j.get("decision") == "block"
+      and "$25 budget" in j.get("reason", "") and "again" in j.get("reason", ""), out)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b2", "prompt": "next", "source": "user"})
+check("budget: sending again goes through", rc == 0 and out.strip() == "", out)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b2", "prompt": "more", "source": "user"})
+check("budget: and stays quiet until the next multiple", rc == 0 and out.strip() == "", out)
+
+cfg_path.write_text(json.dumps({"session_budget_usd": 25}))
+sl("b3", model=OPUS, prompt_cache=pc(**COLD))
+with_cost("b3", 30.0)
+rc, out, _ = run(["hook-prompt"], {"session_id": "b3", "prompt": "next", "source": "user"})
+j = json.loads(out) if out.strip() else {}
+check("budget: with a cold cache too, one message carries both", out.count("systemMessage") == 1
+      and "180k" in j.get("systemMessage", "") and "$25 budget" in j.get("systemMessage", ""), out)
+cfg_path.unlink()
+
 # ---------------- model switch hook
 rc, out, _ = run(["hook-model-switch"], {"session_id": "a", "to_model": "claude-sonnet-5-5"})
 j = json.loads(out) if out.strip() else {}
@@ -608,6 +676,11 @@ p7 = write_session("cost-7", b"".join(line(resp(f"u{k}", NOW - 3000 + 30 * k, MY
 rc, out, _ = cost_sl("cost-7", p7)
 check("statusline cost: nothing priced leaves the block out", rc == 0 and "cost" not in out.splitlines()[0]
       and "misses 0" in out, out)
+
+cfg_path.write_text(json.dumps({"session_budget_usd": 0.01}))
+rc, out, _ = cost_sl("cost-1", p1)
+check("budget: the status line says when the session is over budget", "· over $0.01 budget |" in out.splitlines()[0], out)
+cfg_path.unlink()
 
 cfg_path.write_text(json.dumps({"statusline_cost": False}))
 rc, out, _ = cost_sl("cost-1", p1)

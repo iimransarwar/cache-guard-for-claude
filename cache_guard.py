@@ -69,6 +69,10 @@ DEFAULT_CONFIG = {
     "cold_prompt": "warn",       # warn = only tell you; block = stop a cold message once; off
     "cold_prompt_warn_tokens": 100000,  # only when the message would re-read at least this much
     "cold_prompt_confirm_seconds": 120,
+    "cold_prompt_warn_usd": 0.5,  # on a priced model, act when the re-read costs at least this (0 = token floor only)
+    "session_budget_usd": 0,     # warn when a session's list-price cost passes this, and each multiple (0 = off)
+    "session_budget_action": "warn",  # warn = only tell you; block = stop the message once
+    "session_budget_confirm_seconds": 120,
     "pricing": {},               # override or add list prices: {"model-id-prefix": [in, 5m, 1h, read, out]}
     "statusline_cost": True,     # show session cost, avoidable cost and cache savings on the status line
     "avoidable_warn_pct": 15,    # colour the avoidable figure from this share of the session's cost
@@ -551,49 +555,113 @@ def hook_compact():
     sys.exit(2)
 
 
-def hook_prompt():
-    """Tell the user what a typed message into a big cold session will cost; with cold_prompt=block, stop it once."""
-    data = read_stdin_json()
-    cfg = load_config()
-    mode = str(cfg.get("cold_prompt", "warn")).lower()
-    source = data.get("source")
-    if mode == "off" or source not in (None, "user"):
-        return  # loops, scheduled tasks, SDK and system turns are never touched
-    if str(data.get("prompt") or "").lstrip().startswith("/"):
-        return  # /clear and /compact are the way out, so never stand in front of a command
-    sid = data.get("session_id")
-    state = load_state(sid)
-    exp, est = state.get("expires_at"), state.get("recache_tokens_if_cold")
-    if not state or not exp or not est or not state.get("caching_observed", True) or cache_is_warm(state):
-        return
+def over_cold_floor(cfg, tokens, usd):
+    """Priced model with a dollar floor set: the re-read must cost at least that. Otherwise the token floor."""
     try:
-        if int(est) < int(cfg["cold_prompt_warn_tokens"]) or state.get("cold_ack_for") == exp:
-            return
-        ago = fmt_gap(max(0.0, time.time() - float(exp)))
+        floor = float(cfg.get("cold_prompt_warn_usd") or 0)
     except Exception:
-        return
-    usd, warm_usd = cold_cost(cfg, state.get("model_id"), est, state.get("ttl"))
+        floor = 0.0
+    if usd is not None and floor > 0:
+        return usd >= floor
+    return int(tokens) >= int(cfg["cold_prompt_warn_tokens"])
+
+
+def cold_prompt_check(cfg, state, source, now):
+    """('warn' | 'block' | None, text) for a typed message into a big cold session. Updates state."""
+    mode = str(cfg.get("cold_prompt", "warn")).lower()
+    exp, est = state.get("expires_at"), state.get("recache_tokens_if_cold")
+    if mode == "off" or not exp or not est or not state.get("caching_observed", True) or cache_is_warm(state):
+        return None, None
+    try:
+        if state.get("cold_ack_for") == exp:
+            return None, None
+        ago = fmt_gap(max(0.0, now - float(exp)))
+        usd, warm_usd = cold_cost(cfg, state.get("model_id"), est, state.get("ttl"))
+        if not over_cold_floor(cfg, est, usd):
+            return None, None
+    except Exception:
+        return None, None
     price = f", about {fmt_usd(usd)} at API list price (about {fmt_usd(warm_usd)} if it were warm)" if usd else ""
-    what = f"cache-guard: the cache went cold {ago} ago. This message re-reads ~{fmt_tokens(est)} tokens uncached{price}."
-    now = time.time()
+    what = f"the cache went cold {ago} ago. This message re-reads ~{fmt_tokens(est)} tokens uncached{price}."
     window = int(cfg["cold_prompt_confirm_seconds"])
     asked = state.get("cold_confirm") or [None, 0]
     if mode != "block" or source != "user":
         # warn mode, or a Claude Code build that doesn't say who sent the prompt: tell, don't stop
         state["cold_ack_for"] = exp
-        save_state(sid, state)
-        emit({"systemMessage": f"{what} For a new task, /clear first is far cheaper."})
-        return
+        return "warn", f"{what} For a new task, /clear first is far cheaper."
     if asked[0] == exp and now - float(asked[1]) < window:
         state["cold_ack_for"] = exp  # confirmed: stay quiet until the cache has warmed and gone cold again
         state.pop("cold_confirm", None)
-        save_state(sid, state)
-        return
+        return None, None
     state["cold_confirm"] = [exp, now]
-    save_state(sid, state)
-    emit({"decision": "block",
-          "reason": (f"{what} New task? /clear first is far cheaper. Same task? Send it again within "
-                     f"{max(1, window // 60)} minutes to go ahead.")})
+    return "block", (f"{what} New task? /clear first is far cheaper. Same task? Send it again within "
+                     f"{max(1, window // 60)} minutes to go ahead.")
+
+
+def session_budget(cfg):
+    try:
+        b = float(cfg.get("session_budget_usd") or 0)
+    except Exception:
+        return 0.0
+    return b if b > 0 else 0.0
+
+
+def fmt_budget(x):
+    return f"${x:,.0f}" if float(x).is_integer() else fmt_usd(x)
+
+
+def budget_check(cfg, state, source, now):
+    """('warn' | 'block' | None, text) when the session's cost first passes the budget, and each further multiple."""
+    budget = session_budget(cfg)
+    try:
+        cost = float(((state.get("costs") or {}).get("shown") or {}).get("cost"))
+    except Exception:
+        return None, None
+    if not budget:
+        return None, None
+    level = int(cost // budget)
+    if level < 1 or level <= int(state.get("budget_ack") or 0):
+        return None, None
+    times = f"{level}× " if level > 1 else ""
+    what = f"this session has cost {fmt_usd(cost)} at API list price, past {times}your {fmt_budget(budget)} budget."
+    window = int(cfg.get("session_budget_confirm_seconds", 120))
+    if str(cfg.get("session_budget_action", "warn")).lower() != "block" or source != "user":
+        state["budget_ack"] = level
+        return "warn", f"{what} For the next task, /clear starts a fresh, cheaper session."
+    asked = state.get("budget_confirm") or [None, 0]
+    if asked[0] == level and now - float(asked[1]) < window:
+        state["budget_ack"] = level
+        state.pop("budget_confirm", None)
+        return None, None
+    state["budget_confirm"] = [level, now]
+    return "block", f"{what} Send it again within {max(1, window // 60)} minutes to go ahead, or /clear to start fresh."
+
+
+def hook_prompt():
+    """Typed messages only: warn (or, if asked for, stop once) when a big cold session re-reads its history, and when
+    the session passes its budget. Both messages go out as one."""
+    data = read_stdin_json()
+    cfg = load_config()
+    source = data.get("source")
+    if source not in (None, "user"):
+        return  # loops, scheduled tasks, SDK and system turns are never touched
+    if str(data.get("prompt") or "").lstrip().startswith("/"):
+        return  # /clear and /compact are the way out, so never stand in front of a command
+    sid = data.get("session_id")
+    state = load_state(sid)
+    if not state:
+        return
+    before, now = json.dumps(state, sort_keys=True), time.time()
+    found = [r for r in (cold_prompt_check(cfg, state, source, now), budget_check(cfg, state, source, now)) if r[0]]
+    if json.dumps(state, sort_keys=True) != before:
+        save_state(sid, state)
+    if not found:
+        return
+    text = "cache-guard: " + " Also, ".join(t for _, t in found)
+    if any(kind == "block" for kind, _ in found):
+        emit({"decision": "block", "reason": text})
+    else:
+        emit({"systemMessage": text})
 
 
 def last_context_tokens(transcript_path):
@@ -1543,6 +1611,9 @@ def cost_block(cfg, state):
                 warn = 15.0
             txt = f"avoidable {fmt_usd(avoid)}"
             parts.append(f"{YEL}{txt}{RST}" if cost > 0 and 100 * avoid / cost >= warn else txt)
+        budget = session_budget(cfg)
+        if budget and cost >= budget:
+            parts.append(f"{RED}over {fmt_budget(budget)} budget{RST}")
         return " | " + " · ".join(parts)
     except Exception:
         return ""
