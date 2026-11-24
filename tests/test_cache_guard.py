@@ -114,6 +114,50 @@ COLD = dict(warm=False, expires_at=NOW - 600, misses=1)
 rc, out, _ = sl("p", model=OPUS, prompt_cache=pc(**COLD))
 check("statusline: cold shows list-price cost when the model is known", "re-reads ~180k (~$1.44)" in out, out)
 
+# ---------------- usage pace forecast
+PACE = HOME / ".claude" / "cache-guard" / "pace.json"
+R5 = NOW + 3 * 3600
+
+
+def pace_sl(sid, used, samples, reset=R5, seed_reset=None, extra_limits=None, **kw):
+    PACE.parent.mkdir(parents=True, exist_ok=True)
+    PACE.write_text(json.dumps({"All models|5h": {"reset": seed_reset or reset, "samples": samples}}))
+    rl = {"five_hour": {"used_percentage": used, "resets_at": reset}}
+    rl.update(extra_limits or {})
+    return sl(sid, prompt_cache=pc(), rate_limits=rl, **kw)
+
+
+rc, out, err = pace_sl("pace-1", 60, [[NOW - 1200, 40.0]])
+check("pace: a fast burn says when the limit runs out", rc == 0
+      and re.search(r"All models: 40% left \(out in ~4\dm\)", out.splitlines()[0]) is not None, out + err)
+check("pace: and the tip says how long before the reset",
+      re.search(r"tip: At this pace the 5-hour limit for all models runs out in ~4\dm, 2\.\dh before it resets", out)
+      is not None, out)
+rc, out, err = pace_sl("pace-2", 60, [[NOW - 1200, 59.0]])
+check("pace: a pace that lasts past the reset shows nothing", "40% left" in out and "out in" not in out, out)
+rc, out, err = pace_sl("pace-3", 60, [[NOW - 120, 40.0]])
+check("pace: under 5 minutes of readings shows nothing", "out in" not in out, out)
+rc, out, err = pace_sl("pace-4", 60, [[NOW - 1200, 40.0]], seed_reset=NOW + 600)
+check("pace: a new reset time starts the readings over", "out in" not in out
+      and json.loads(PACE.read_text())["All models|5h"]["reset"] == R5, out + PACE.read_text())
+rc, out, err = pace_sl("pace-5", 60, [[NOW - 1200, 40.0]], extra_limits={"seven_day": {"used_percentage": 10,
+                                                                                         "resets_at": NOW + 5 * 86400}})
+check("pace: with two windows it names the one running out", re.search(r"40% left \(5h, out in ~4\dm\) · 90% left \(week\)",
+                                                                          out) is not None, out)
+rc, out, err = pace_sl("pace-6", 60, [[NOW - 4000, 10.0]])
+check("pace: readings older than the window are dropped", "out in" not in out
+      and all(NOW - 2000 < x[0] for x in json.loads(PACE.read_text())["All models|5h"]["samples"]), out + PACE.read_text())
+cfg_path_p = HOME / ".claude" / "cache-guard" / "config.json"
+cfg_path_p.parent.mkdir(parents=True, exist_ok=True)
+cfg_path_p.write_text(json.dumps({"pace_forecast": False}))
+rc, out, err = pace_sl("pace-7", 60, [[NOW - 1200, 40.0]])
+check("pace: pace_forecast=false turns it off", rc == 0 and "out in" not in out and "At this pace" not in out, out)
+cfg_path_p.unlink()
+PACE.write_text("{junk")
+rc, out, err = sl("pace-8", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 60, "resets_at": R5}})
+check("pace: a corrupt pace.json never breaks the line", rc == 0 and "40% left" in out and not err, out + err)
+PACE.unlink()
+
 # ---------------- cold-message guard
 sl("p0", model=OPUS, prompt_cache=pc(**COLD))
 rc, out, _ = run(["hook-prompt"], {"session_id": "p0", "prompt": "continue", "source": "user"})

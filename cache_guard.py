@@ -51,6 +51,7 @@ GUARD_DIR = CLAUDE_DIR / "cache-guard"
 STATE_DIR = GUARD_DIR / "state"
 LOG_DIR = GUARD_DIR / "logs"
 CONFIG_PATH = GUARD_DIR / "config.json"
+PACE_PATH = GUARD_DIR / "pace.json"                  # recent usage-limit readings, for the pace forecast
 TOTALS_PATH = GUARD_DIR / "totals.json"              # all-projects figures the status line shows
 TOTALS_FILES_PATH = GUARD_DIR / "totals-files.json"  # per-transcript figures, so a scan re-reads only what changed
 TOTALS_LOCK = GUARD_DIR / "totals.lock"              # held while a background scan runs
@@ -64,6 +65,8 @@ DEFAULT_CONFIG = {
     "expiry_warn_minutes": 3,    # status-line warning threshold
     "context_warn_pct": 75,      # suggest /compact at a break above this
     "limit_warn_pct": 80,        # 5-hour / 7-day usage warning threshold
+    "pace_forecast": True,       # say when the recent pace uses a limit up before it resets
+    "pace_window_minutes": 30,   # how far back the pace is measured
     "resume_warn_tokens": 50000, # warn on resume when re-sending more than this, uncached
     "compact_confirm_seconds": 120,
     "cold_prompt": "warn",       # warn = only tell you; block = stop a cold message once; off
@@ -338,8 +341,51 @@ def usage_limits(data):
     return sorted(found, key=lambda x: (x["group"], first[x["scope"]], windows.get(x["short"], 2)))
 
 
-def limits_text(limits, cfg):
-    """'Fable: 61% left · All models: 58% left (5h) · 82% left (week)', coloured by how much is used."""
+PACE_MIN_SPAN = 300   # seconds of readings needed before forecasting
+PACE_MIN_RISE = 1.0   # percentage points the limit must have risen over them
+
+
+def pace_key(x):
+    return f"{x['scope']}|{x['short'] or ''}"
+
+
+def pace_forecast(limits, cfg, now):
+    """{pace_key: seconds until used up} for every limit the recent pace uses up before it resets. Keeps one reading per
+    limit per minute in PACE_PATH; a new reset time starts that limit's readings over. Never raises."""
+    out = {}
+    try:
+        on = cfg.get("pace_forecast", True)
+        if on is False or str(on).strip().lower() in ("false", "0", "off", "no", "none") or not limits:
+            return out
+        window = float(cfg.get("pace_window_minutes", 30)) * 60
+        data = read_json(PACE_PATH) if PACE_PATH.exists() else None
+        data = data if isinstance(data, dict) else {}
+        for x in limits:
+            k, reset = pace_key(x), x["reset"]
+            e = data.get(k)
+            try:
+                same = isinstance(e, dict) and (e.get("reset") == reset or abs(float(e["reset"]) - float(reset)) < 60)
+            except Exception:
+                same = False
+            samples = [r for r in (e.get("samples") or []) if isinstance(r, list) and len(r) == 2
+                       and now - float(r[0]) <= window] if same else []
+            if not samples or now - float(samples[-1][0]) >= 60 or float(samples[-1][1]) != x["used"]:
+                samples.append([now, x["used"]])
+            data[k] = {"reset": reset, "samples": samples[-200:]}
+            span, rise = now - float(samples[0][0]), x["used"] - float(samples[0][1])
+            if reset and span >= PACE_MIN_SPAN and rise >= PACE_MIN_RISE:
+                secs = x["left"] / (rise / span)
+                if now + secs < float(reset):
+                    out[k] = secs
+        write_json_atomic(PACE_PATH, data)
+    except Exception:
+        pass
+    return out
+
+
+def limits_text(limits, cfg, pace=None):
+    """'Fable: 61% left · All models: 58% left (5h, out in ~40m) · 82% left (week)', coloured by how much is used, and
+    yellow at least when the recent pace uses it up before it resets."""
     scopes = {}
     for x in limits:
         scopes.setdefault(x["scope"], []).append(x)
@@ -347,8 +393,13 @@ def limits_text(limits, cfg):
     for scope, items in scopes.items():
         bits = []
         for x in items:
-            colour = RED if x["used"] >= 90 else YEL if x["used"] >= cfg["limit_warn_pct"] else ""
-            window = f" ({x['short']})" if len(items) > 1 and x["short"] else ""
+            secs = (pace or {}).get(pace_key(x))
+            colour = (RED if x["used"] >= 90 else YEL if x["used"] >= cfg["limit_warn_pct"] or secs is not None
+                      else "")
+            notes = [x["short"]] if len(items) > 1 and x["short"] else []
+            if secs is not None:
+                notes.append(f"out in ~{fmt_gap(secs)}")
+            window = f" ({', '.join(notes)})" if notes else ""
             bits.append(f"{colour}{x['left']:.0f}% left{window}{RST if colour else ''}")
         parts.append(f"{scope}: {' · '.join(bits)}")
     return " · ".join(parts)
@@ -403,7 +454,8 @@ def cmd_statusline():
     rotating = TIPS[int(now // 60) % len(TIPS)]
 
     limits = usage_limits(data)
-    limits_txt = f" | {limits_text(limits, cfg)}" if limits else ""
+    pace = pace_forecast(limits, cfg, now)
+    limits_txt = f" | {limits_text(limits, cfg, pace)}" if limits else ""
 
     if data.get("transcript_path"):
         state["transcript_path"] = data["transcript_path"]
@@ -484,6 +536,12 @@ def cmd_statusline():
                    f"NOW, since you'll rebuild anyway.")
     elif mins_left is not None and mins_left < cfg["expiry_warn_minutes"]:
         tip = f"{YEL}Cache expires in {mins_left + 1}m.{RST} Reply soon or the next turn rebuilds it."
+    elif pace:
+        x = min((x for x in limits if pace_key(x) in pace), key=lambda x: pace[pace_key(x)])
+        secs, name = pace[pace_key(x)], limit_name(x)
+        tip = (f"{YEL}At this pace the {name[0].lower() + name[1:]} runs out in ~{fmt_gap(secs)}{RST}, "
+               f"{fmt_gap(float(x['reset']) - now - secs)} before it resets ({fmt_clock(x['reset'])}). "
+               f"/effort low and fewer subagents stretch it.")
     elif hot_limit:
         left = f"{hot_limit['left']:.0f}"
         when = f" (resets {fmt_clock(hot_limit['reset'])})" if hot_limit["reset"] else ""
