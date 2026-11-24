@@ -6,11 +6,11 @@ Every turn, Claude Code re-sends your whole conversation. Prompt caching bills t
 
 cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 174](https://img.shields.io/badge/tests-174%20checks-2ea44f)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 175](https://img.shields.io/badge/tests-175%20checks-2ea44f)
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 42% left (5h, out in ~40m) · 82% left (week)
-30d all projects: cache cut $38,520 → $4,310 (-89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
+30d at API prices: $4,310 (would be $38,520 without cache, -89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
 tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before it resets (15:10). /effort low and fewer subagents stretch it.
 ```
 
@@ -19,7 +19,7 @@ tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before 
 ## What you get
 
 - **See the money, live.** `cache cut $60.50 → $12.40` is what this session would have cost without the cache, then what it did cost. `avoidable $1.90` is what was spent rebuilding a cache that should have been read.
-- **Every project at a glance.** A second line adds up the last 30 days across every project and names the three where caching saved the most. It's refreshed in the background, so the status line never slows down.
+- **Every project at a glance.** A second line prices the last 30 days across every project at API rates, shows what it would have cost without the cache, and names the three projects where caching saved the most. It's refreshed in the background, so the status line never slows down.
 - **Know before you hit the wall.** A pace forecast measures how fast your 5-hour limit is rising right now and says `out in ~40m` when you'd run out before the reset. Idle hours never skew it, and it stays silent when you're fine.
 - **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache says how much it would re-read and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task.
 - **A budget, if you want one.** Set `session_budget_usd` and you're told when a session, subagents included, passes it, and again at each multiple. Or have the message stopped once.
@@ -47,7 +47,7 @@ There are other ways to attack the same problem. Each one gives up something cac
 - **No proxy, no token.** It never sits in front of your API traffic and never reads your login credentials.
 - **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, and the Lean output style changes how Claude writes its replies.
 - **Your settings, backed up.** Install backs up `settings.json`, keeps your own hooks, and uninstalls in one command.
-- **Readable.** One file, standard library only, with a 174-check test suite that runs against a throwaway home folder.
+- **Readable.** One file, standard library only, with a 175-check test suite that runs against a throwaway home folder.
 
 ## Install
 
@@ -89,7 +89,7 @@ Three lines, refreshed every 30 seconds:
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 42% left (5h, out in ~40m) · 82% left (week)
-30d all projects: cache cut $38,520 → $4,310 (-89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
+30d at API prices: $4,310 (would be $38,520 without cache, -89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
 tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before it resets (15:10). /effort low and fewer subagents stretch it.
 ```
 
@@ -100,7 +100,7 @@ The money figures are for the current session at API list prices. On a subscript
 
 Requests on models without a price are left out of every figure, as in `report`. If nothing in the session can be priced, the block is left out. The status line keeps running totals in its state file and reads only what the transcripts gained since the last refresh. It spends at most half a second reading per refresh. If a refresh runs out of time (the first one on a very large session, for example), it shows the last figures it had, or none yet, and carries on at the next refresh. An error leaves the block out, never the line. Turn it off with `statusline_cost`.
 
-**All-projects line**: the same cache cut, for every session in every project over the last `totals_days` days (default 30), then the three projects caching saved the most in. The figures match `report --all --days 30` (its two cost rows added together). Projects are named after the folder the session ran in. Reading 30 days of transcripts can take several seconds, so the status line never does it itself: it shows the last saved figures, and when they are over `totals_refresh_minutes` old (default 10) it starts one scan in the background. A lock file makes sure several open sessions start only one scan between them; a running scan keeps its lock fresh, and a scan that dies or fails frees it after 5 minutes. After the first scan, only transcripts that changed are read again. Until the first scan finishes the line says `counting…`. With nothing priced, the line is left out. Turn it off with `statusline_totals`.
+**All-projects line**: what every session in every project cost over the last `totals_days` days (default 30) at API list prices, main conversations and subagents included, then what the same calls would have cost without the cache, then the three projects caching saved the most in. On a subscription it is not your bill; it shows what the same usage would cost on the API. The figures match `report --all --days 30` (its two cost rows added together). Projects are named after the folder the session ran in. Reading 30 days of transcripts can take several seconds, so the status line never does it itself: it shows the last saved figures, and when they are over `totals_refresh_minutes` old (default 10) it starts one scan in the background. A lock file makes sure several open sessions start only one scan between them; a running scan keeps its lock fresh, and a scan that dies or fails frees it after 5 minutes. After the first scan, only transcripts that changed are read again. Until the first scan finishes the line says `counting…`. With nothing priced, the line is left out. Turn it off with `statusline_totals`.
 
 Usage limits show as percent left, named for whom they apply to. When a limit has both a 5-hour and a weekly window, each says which it is, as in `All models: 58% left (5h) · 82% left (week)`. A limit for a single model comes first, under that model's name, for example `Fable: 61% left`. Behind a Claude apps gateway, a spend limit shows as `Spend limit: 37% left`. Any other limit Claude Code passes in the same shape is shown too, named from its key (`seven_day_fable` would read as the weekly Fable limit). A limit turns yellow at `limit_warn_pct` used (default 80%) and red at 90% used. With no limit data, on an API key for example, this part is left out.
 
@@ -207,7 +207,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ### Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 174 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 175 checks against a throwaway HOME
 ```
 
 ### Caveats

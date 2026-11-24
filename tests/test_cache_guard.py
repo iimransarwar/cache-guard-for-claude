@@ -735,6 +735,13 @@ got = json.loads(subprocess.run([sys.executable, "-B", "-c", CUT, str(ROOT), jso
 check("statusline cost: cache cut wording never says -0%, nor not-paid-back once it has",
       got == ["cache cut $60.50 → $12.40 (-80%)", "cache cut $5.01 → $5.00 (<1%)", "cache cut $100 → $100 (<1%)",
               "cost $12.40", "cost $12.40 · cache not paid back yet"], json.dumps(got))
+API = ("import sys, json; sys.path.insert(0, sys.argv[1]); import cache_guard as cg; "
+       "print(json.dumps([cg.api_price_text(*a) for a in json.loads(sys.argv[2])]))")
+got = json.loads(subprocess.run([sys.executable, "-B", "-c", API, str(ROOT), json.dumps(cut_cases)], capture_output=True,
+                                text=True, env=ENV).stdout or "[]")
+check("totals: API-price wording leads with the cost, never says -0% or a false not-paid-back",
+      got == ["$12.40 (would be $60.50 without cache, -80%)", "$5.00 (would be $5.01 without cache, <1%)",
+              "$100 (would be $100 without cache, <1%)", "$12.40", "$12.40 (cache not paid back yet)"], json.dumps(got))
 check("statusline cost: a tip explains cache cut", any("cache cut" in t and "5%" in t for t in tips), json.dumps(tips))
 p7 = write_session("cost-7", b"".join(line(resp(f"u{k}", NOW - 3000 + 30 * k, MYST, 1000, 30000 * k)) for k in range(4)), {})
 rc, out, _ = cost_sl("cost-7", p7)
@@ -903,9 +910,9 @@ rc, out, err = sl("tot-1", prompt_cache=pc())
 lines = out.splitlines()
 row = lines[1] if len(lines) == 3 else ""
 check("totals: row sits between the cache line and the tip", rc == 0 and len(lines) == 3 and lines[2].startswith("tip:")
-      and re.fullmatch(r"30d all projects: cache cut \$[\d,.]+ → \$[\d,.]+ \(-\d+%\) \| most saved: .+", row) is not None,
+      and re.fullmatch(r"30d at API prices: \$[\d,.]+ \(would be \$[\d,.]+ without cache, -\d+%\) \| most saved: .+", row) is not None,
       out + err)
-check("totals: row figures are the scan's", f"cache cut {fmt(t['cost'] + t['saved'])} → {fmt(t['cost'])} " in row,
+check("totals: row figures are the scan's", f"API prices: {fmt(t['cost'])} (would be {fmt(t['cost'] + t['saved'])} without cache, " in row,
       f"{row}\n{t['cost']} {t['saved']}")
 top = row.split("most saved: ")[-1]
 want = [x["name"] for x in sorted(t["projects"], key=lambda x: -x["saved"]) if x["saved"] > 0][:3]
@@ -915,11 +922,11 @@ check("totals: top 3 only, most saved first, compact amounts", top.count(" · ")
 check("totals: long project names are cut to 24 characters", "a" * 23 + "… " in row and "a" * 24 not in row, row)
 rc, out, err = sl("tot-2")
 check("totals: also shown while waiting for the first response", rc == 0 and len(out.splitlines()) == 3
-      and out.splitlines()[1].startswith("30d all projects: cache cut"), out + err)
+      and out.splitlines()[1].startswith("30d at API prices: $"), out + err)
 
 TOTALS_JSON.rename(TOTALS_JSON.with_name("totals.bak"))
 rc, out, err = sl("tot-3", prompt_cache=pc())
-check("totals: before the first scan it says counting…", rc == 0 and out.splitlines()[1:2] == ["30d all projects: counting…"],
+check("totals: before the first scan it says counting…", rc == 0 and out.splitlines()[1:2] == ["30d at API prices: counting…"],
       out + err)
 TOTALS_JSON.write_text("{junk")
 rc, out, err = sl("tot-4", prompt_cache=pc())
@@ -935,13 +942,13 @@ env2 = {**ENV, "HOME": str(home2)}
 rc1, _, _ = run(["totals-refresh"], env=env2)
 rc, out, err = sl("tot-5", prompt_cache=pc(), env=env2)
 check("totals: nothing priced leaves the row out", rc1 == 0 and rc == 0
-      and (home2 / ".claude" / "cache-guard" / "totals.json").exists() and "all projects" not in out, out + err)
+      and (home2 / ".claude" / "cache-guard" / "totals.json").exists() and "API prices" not in out, out + err)
 
 cfg_path.write_text(json.dumps({"statusline_totals": False}))
 TOTALS_JSON.unlink(missing_ok=True)
 rc, out, err = sl("tot-6", prompt_cache=pc(), env=SPAWN_ENV)
 time.sleep(1.5)
-check("totals: statusline_totals=false leaves the row out and starts nothing", rc == 0 and "all projects" not in out
+check("totals: statusline_totals=false leaves the row out and starts nothing", rc == 0 and "API prices" not in out
       and not TOTALS_JSON.exists() and not TOTALS_LOCK.exists(), out + err)
 cfg_path.unlink()
 

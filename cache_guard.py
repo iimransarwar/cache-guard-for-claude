@@ -231,9 +231,21 @@ def cut_text(cost, saved):
         return f"cost {fmt_usd(cost)} · cache not paid back yet"
     if saved == 0:
         return f"cost {fmt_usd(cost)}"
-    before = cost + saved
-    pct = round(100 * saved / before)
-    return f"cache cut {fmt_usd(before)} → {fmt_usd(cost)} ({f'-{pct}%' if pct >= 1 else '<1%'})"
+    return f"cache cut {fmt_usd(cost + saved)} → {fmt_usd(cost)} ({cut_pct(cost, saved)})"
+
+
+def cut_pct(cost, saved):
+    pct = round(100 * saved / (cost + saved))
+    return f"-{pct}%" if pct >= 1 else "<1%"
+
+
+def api_price_text(cost, saved):
+    """'$4,638 (would be $41,147 without cache, -89%)': the cost at API list price first, then the same calls uncached."""
+    if saved < 0:
+        return f"{fmt_usd(cost)} (cache not paid back yet)"
+    if saved == 0:
+        return fmt_usd(cost)
+    return f"{fmt_usd(cost)} (would be {fmt_usd(cost + saved)} without cache, {cut_pct(cost, saved)})"
 
 
 def fmt_gap(seconds):
@@ -1935,18 +1947,18 @@ def short_name(name):
 
 
 def totals_line(cfg, now):
-    """'30d all projects: cache cut $A → $B (-N%) | most saved: x $1.2k · y $340 · z $12.50' from the last scan,
+    """'30d at API prices: $B (would be $A without cache, -N%) | most saved: x $1.2k · y $340 · z $12.50' from the last scan,
     'counting…' before the first one, or None when it is off, nothing is priced or anything goes wrong."""
     try:
         if not totals_on(cfg):
             return None
         t = read_totals()
         if t is None:
-            return f"{DIM}{float(cfg.get('totals_days', 30)):g}d all projects:{RST} counting…"
+            return f"{DIM}{float(cfg.get('totals_days', 30)):g}d at API prices:{RST} counting…"
         cost, saved = float(t["cost"]), float(t["saved"])
         if cost == 0 and saved == 0:
             return None
-        text = f"{DIM}{float(t['days']):g}d all projects:{RST} {cut_text(cost, saved)}"
+        text = f"{DIM}{float(t['days']):g}d at API prices:{RST} {api_price_text(cost, saved)}"
         top = sorted((x for x in t.get("projects") or [] if float(x.get("saved", 0)) > 0),
                      key=lambda x: -float(x["saved"]))[:3]
         if top:
