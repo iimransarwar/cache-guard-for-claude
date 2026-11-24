@@ -263,6 +263,299 @@ rc, out, err = run(["report", "sess-2"])
 check("report: prices can be overridden in config.json", "about $13.12" in out, out + err)
 cfg_path.unlink()
 
+# ---------------- status line: session cost, avoidable cost and cache savings
+STATE = HOME / ".claude" / "cache-guard" / "state"
+cdir = HOME / ".claude" / "projects" / "-cost-tests"  # its own folder, so the report tests above are unaffected
+cdir.mkdir(parents=True, exist_ok=True)
+O, S, H, MYST = "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-mystery-1"
+MONEY = re.compile(r"\| cost (\$[\d,.]+)(?: · avoidable (\$[\d,.]+))? · saved (-?\$[\d,.]+) \|")
+
+# A full read with the report's own functions. Saved is restated here from its definition, not taken from the script.
+REF = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import cache_guard as cg
+from pathlib import Path
+path = Path(sys.argv[2])
+table = cg.price_table(cg.load_config())
+def saved(rows):
+    total = 0.0
+    for r in rows:
+        p = cg.price_for(table, r["model"], r["inp"] + r["write"] + r["read"])
+        if p:
+            w5, w1 = (r["w5"], r["w1"]) if r["w5"] + r["w1"] else (r["write"], 0)
+            total += (r["read"] * (p[0] - p[3]) - w5 * (p[1] - p[0]) - w1 * (p[2] - p[0])) / 1e6
+    return total
+main = cg.load_requests(path)
+subs = [cg.load_requests(f, sidechain=True) for f in cg.subagent_files(path)]
+cost = cg.total_cost(cg.summarise(main, table)) + sum(cg.total_cost(cg.summarise(s, table)) for s in subs)
+avoid = sum(x["usd"] or 0.0 for x in cg.find_rebuilds(main, table) if x["kind"] not in cg.EXPECTED)
+priced = sum(1 for rows in [main] + subs for r in rows if cg.price_for(table, r["model"], 0))
+print(json.dumps({"cost": cost, "avoidable": avoid, "saved": saved(main) + sum(saved(s) for s in subs), "priced": priced}))
+'''
+PATCH = ("import json, sys; sys.path.insert(0, sys.argv[1]); import cache_guard as cg\n"
+         "for k, v in json.loads(sys.argv[2]).items(): setattr(cg, k, v)\n"
+         "exec(sys.argv[3])\n"
+         "sys.argv = ['cache_guard.py'] + sys.argv[4:]\n"
+         "cg.main()")
+
+
+def reference(path):
+    p = subprocess.run([sys.executable, "-B", "-c", REF, str(ROOT), str(path)], capture_output=True, text=True, env=ENV)
+    return json.loads(p.stdout)
+
+
+def cost_sl(sid, path, consts=None, pre="", raw=False, **pc_kw):
+    """Status line for a session whose transcript is `path`; consts/pre patch the module first (budget, block size)."""
+    payload = {"session_id": sid, "model": OPUS, "transcript_path": str(path), "prompt_cache": pc(**pc_kw)}
+    p = subprocess.run([sys.executable, "-B", "-c", PATCH, str(ROOT), json.dumps(consts or {}), pre, "statusline"],
+                       input=json.dumps(payload), capture_output=True, text=True, env=ENV, cwd=WORK)
+    return p.returncode, (p.stdout if raw else ANSI.sub("", p.stdout)), p.stderr
+
+
+def usd(s):
+    return float(s.replace("$", "").replace(",", "")) if s else 0.0
+
+
+def money(out):
+    m = MONEY.search(out.splitlines()[0] if out.strip() else "")
+    return m and {"cost": usd(m.group(1)), "avoidable": usd(m.group(2)), "saved": usd(m.group(3)), "text": m.group(0)}
+
+
+def agrees(fig, ref):
+    """Printed figures match a full read to the cent (fmt_usd rounds to cents below $100)."""
+    return bool(fig) and all(abs(fig[k] - ref[k]) <= 0.0051 for k in ("cost", "avoidable", "saved"))
+
+
+def exact(sid, ref):
+    """The running totals kept in the state file match a full read, not just to the cent."""
+    try:
+        s = json.loads((STATE / f"{sid}.json").read_text())["costs"]["shown"]
+        return all(abs(s[k] - ref[k]) < 1e-9 for k in ("cost", "avoidable", "saved"))
+    except Exception:
+        return False
+
+
+def line(rec):
+    return (json.dumps(rec, ensure_ascii=False) + "\n").encode()
+
+
+def resp(i, t, model, w, r, out=300, ttl="1h", side=False, split=True, text="ok → done"):
+    u = {"input_tokens": 7, "cache_creation_input_tokens": w, "cache_read_input_tokens": r, "output_tokens": out}
+    if split:
+        u["cache_creation"] = {"ephemeral_1h_input_tokens": w if ttl == "1h" else 0,
+                               "ephemeral_5m_input_tokens": w if ttl == "5m" else 0}
+    return {"type": "assistant", "timestamp": iso(t), "isSidechain": side, "requestId": f"req_{i}",
+            "message": {"id": f"msg_{i}", "model": model, "role": "assistant",
+                        "content": [{"type": "text", "text": text}], "usage": u}}
+
+
+def session_bytes(tag):
+    """A main transcript with every kind of rebuild, and two subagent files. Returns (main, {relpath: bytes})."""
+    t, out, prefix, n = NOW - 8 * 3600, [], 0, [0]
+
+    def ask(dt, model, grow, miss=False, **kw):
+        nonlocal t, prefix
+        t += dt
+        n[0] += 1
+        read, write = (0, prefix + grow) if miss else (prefix, grow)
+        out.append(line({"type": "user", "timestamp": iso(t - 2), "message": {"role": "user", "content": "go " * 40}}))
+        out.append(line(resp(f"{tag}{n[0]}", t, model, write, read, **kw)))
+        prefix = read + write
+
+    ask(0, O, 40000)                                    # session start (expected)
+    for _ in range(9):
+        ask(45, O, 1500)                                # warm appends
+    t += 40                                             # a streamed response logged twice: the last line counts
+    n[0] += 1
+    out.append(line(resp(f"{tag}{n[0]}", t, O, 1200, prefix, out=12)))
+    out.append(line(resp(f"{tag}{n[0]}", t, O, 1200, prefix, out=480)))
+    prefix += 1200
+    ask(5400, O, 900, miss=True)                        # idle 1.5h on a 1h cache
+    ask(50, O, 700)
+    out.append(line(resp("side-0", t + 5, H, 99999, 0, side=True)))  # sidechain line in the main file: skipped
+    ask(60, S, 500, miss=True)                          # model switch
+    ask(30, S, 800, ttl="5m")
+    out.append(line({"type": "system", "subtype": "compact_boundary", "timestamp": iso(t + 20)}))
+    prefix = 0
+    ask(30, S, 20000, ttl="5m")                         # after compaction (expected)
+    ask(30, S, 600, ttl="5m")
+    out.append(line({"type": "attachment", "attachment": {"type": "session_context"}, "timestamp": iso(t + 10)}))
+    ask(30, S, 300, miss=True, ttl="5m")                # resumed or restarted
+    ask(30, S, 400, ttl="5m")
+    out.append(line({"type": "attachment", "attachment": {"type": "deferred_tools_delta"}, "timestamp": iso(t + 10)}))
+    ask(30, S, 300, miss=True, ttl="5m")                # tools changed
+    ask(30, S, 400, ttl="5m")
+    ask(30, S, 200, miss=True, ttl="5m")                # prefix changed, cause unknown
+    ask(30, MYST, 100, miss=True)                       # unpriced model: left out of every figure
+    ask(30, S, 100, miss=True, ttl="5m")                # back again: a priced model switch
+    ask(30, S, 300, ttl="5m", split=False)              # no 5m/1h split recorded
+    for _ in range(3):
+        ask(30, S, 250, ttl="5m")
+
+    a, ts, p2 = [], NOW - 7 * 3600, 0
+    for k, (dt, grow, miss) in enumerate([(0, 18000, False), (20, 900, False), (20, 700, False), (1300, 400, True),
+                                          (20, 500, False), (20, 300, False)]):
+        ts += dt
+        read, write = (0, p2 + grow) if (miss or k == 0) else (p2, grow)
+        a.append(line(resp(f"{tag}a{k}", ts, S, write, read, out=100, ttl="5m", side=True)))
+        if k == 2:
+            a.append(line(resp(f"{tag}a{k}", ts, S, write, read, out=350, ttl="5m", side=True)))
+        p2 = read + write
+    b = [line(resp(f"{tag}b{k}", NOW - 6 * 3600 + 30 * k, H, w, r, out=200, ttl="5m", side=True))
+         for k, (w, r) in enumerate([(120000, 0), (2000, 120000), (1500, 122000)])]  # large-prompt Haiku price
+    return b"".join(out), {"subagents/agent-a.jsonl": b"".join(a), "workflows/w1/agent-b.jsonl": b"".join(b)}
+
+
+def write_session(name, main, subs):
+    path = cdir / f"{name}.jsonl"
+    path.write_bytes(main)
+    for rel, data in subs.items():
+        f = cdir / name / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(data)
+    return path
+
+
+main_b, subs_b = session_bytes("c")
+p1 = write_session("cost-1", main_b, subs_b)
+ref1 = reference(p1)
+rc, out, err = cost_sl("cost-1", p1)
+fig = money(out)
+check("statusline cost: block sits between the cache and misses parts", rc == 0 and bool(fig)
+      and re.search(r"\(warm, \d+m left, ttl 1h\) \| cost \$[\d.]+ · avoidable \$[\d.]+ · saved -?\$[\d.]+ \| misses 0",
+                    out) is not None, out + err)
+rc, rep, err = run(["report", str(p1)])
+costs = re.findall(r"Cost\s+\$([\d,.]+)\s+at API list price", rep)
+mm = re.search(r"Cache misses: \d+ \([^)]*about (\$[\d,.]+)\)", rep)
+check("statusline cost: cost = the report's main conversation + subagents",
+      bool(fig) and len(costs) == 2 and abs(fig["cost"] - sum(usd(c) for c in costs)) <= 0.0101, f"{out}\n{rep}")
+check("statusline cost: avoidable = the report's cache-miss cost", bool(fig) and bool(mm)
+      and f"avoidable {mm.group(1)}" in fig["text"], f"{out}\n{rep}")
+check("statusline cost: all three agree with a full read", agrees(fig, ref1) and exact("cost-1", ref1),
+      f"{out}\n{ref1}")
+check("statusline cost: an unpriced model is left out, as in the report", "1 requests on unpriced models left out" in rep
+      and ref1["priced"] == 28 - 1 + 9, f"{rep}\n{ref1}")
+
+plain = sl("plain-1", model=OPUS, prompt_cache=pc())[1].splitlines()[0]
+check("statusline cost: the rest of the line is unchanged",
+      bool(fig) and re.sub(r"\d+m left", "", out.splitlines()[0].replace(fig["text"], "|"))
+      == re.sub(r"\d+m left", "", plain), f"{out}\n{plain}")
+
+rc, out2, _ = cost_sl("cost-1", p1)
+check("statusline cost: a second run with nothing new shows the same figures", money(out2) == fig, out2)
+
+# appended in chunks, cut mid-line, between the two lines of a streamed response and just before a newline
+main_b, subs_b = session_bytes("k")
+ends = [i + 1 for i, ch in enumerate(main_b) if ch == 10]
+dup_cut = next(e for e in ends if b'"output_tokens": 12' in main_b[:e] and main_b[:e].endswith(b"}\n"))
+cuts = sorted({ends[2], ends[3] + 40, dup_cut, ends[22] - 1, ends[31] + 7, ends[44], ends[52] - 1, len(main_b) * 9 // 10,
+               len(main_b)})
+
+
+def chunked(name, consts):
+    path = cdir / f"{name}.jsonl"
+    bad = []
+    for k, cut in enumerate(cuts):
+        frac = (k + 1) / len(cuts)
+        with open(path, "ab") as f:  # append only what is new since the last run
+            f.write(main_b[path.stat().st_size if path.exists() else 0:cut])
+        for rel, data in subs_b.items():
+            f2 = cdir / name / rel
+            upto = int(len(data) * frac) if k < len(cuts) - 1 else len(data)
+            if upto:
+                f2.parent.mkdir(parents=True, exist_ok=True)
+                with open(f2, "ab") as g:
+                    g.write(data[f2.stat().st_size if f2.exists() else 0:upto])
+        rc, out, err = cost_sl(name, path, consts)
+        ref = reference(path)
+        if rc or not agrees(money(out), ref) or not exact(name, ref):
+            bad.append(f"cut {cut}: {out.splitlines()[0] if out else err} vs {ref}")
+    return path, bad
+
+
+p2, bad = chunked("cost-2", {})
+check("statusline cost: appended chunks match a full read after every chunk", not bad, "\n".join(bad))
+rc, out_inc, _ = cost_sl("cost-2", p2)
+rc, out_full, _ = cost_sl("cost-2-once", p2)
+check("statusline cost: chunked totals = one full read", bool(money(out_inc)) and money(out_inc) == money(out_full)
+      and exact("cost-2", reference(p2)), f"{out_inc}\n{out_full}")
+p3, bad = chunked("cost-3", {"COST_TAIL": 1, "COST_READ_BLOCK": 97})
+check("statusline cost: chunks still match with 1 open request and 97-byte reads", not bad, "\n".join(bad))
+
+p2.write_bytes(main_b[:ends[30]])
+rc, out, _ = cost_sl("cost-2", p2)
+ref = reference(p2)
+check("statusline cost: a transcript that shrank is read again from the start", agrees(money(out), ref)
+      and exact("cost-2", ref), f"{out}\n{ref}")
+last = main_b[ends[28]:ends[29]].replace(b'"output_tokens": 300', b'"output_tokens": 90000, "pad": "' + b"z" * 300 + b'"')
+p2.write_bytes(main_b[:ends[28]] + last + main_b[ends[29]:ends[30]])
+rc, out, _ = cost_sl("cost-2", p2)
+ref = reference(p2)
+check("statusline cost: an offset no longer at a line boundary means a full read", agrees(money(out), ref)
+      and exact("cost-2", ref), f"{out}\n{ref}")
+
+# time budget: out of time, the line still prints with the last known figures and catches up on later runs
+p5 = write_session("cost-5", *session_bytes("b"))
+tiny = {"COST_BUDGET_SECONDS": 0, "COST_READ_BLOCK": 2500}
+rc, out, err = cost_sl("cost-5", p5, tiny)
+check("statusline cost: over budget on the first run prints the line without figures",
+      rc == 0 and "misses 0" in out and "cost $" not in out and "tip:" in out, out + err)
+runs = 1
+while runs < 80 and not money(out):
+    rc, out, err = cost_sl("cost-5", p5, tiny)
+    runs += 1
+ref5 = reference(p5)
+check("statusline cost: catches up over several runs", runs > 2 and agrees(money(out), ref5) and exact("cost-5", ref5),
+      f"{runs} runs: {out}\n{ref5}")
+before = money(out)
+with open(p5, "ab") as f:
+    for k in range(12):
+        f.write(line(resp(f"extra{k}", NOW - 3600 + k, O, 80000, 0, out=900)))
+rc, out, err = cost_sl("cost-5", p5, tiny)
+check("statusline cost: still catching up shows the last known figures", money(out) == before, f"{out}\n{before}")
+while runs < 160 and money(out) == before:
+    rc, out, err = cost_sl("cost-5", p5, tiny)
+    runs += 1
+ref5 = reference(p5)
+check("statusline cost: and then the new ones", agrees(money(out), ref5) and money(out) != before, f"{out}\n{ref5}")
+
+# colour, zero avoidable, unpriced, switched off, errors
+cfg_path.write_text(json.dumps({"avoidable_warn_pct": 1}))
+rc, out, _ = cost_sl("cost-1", p1, raw=True)
+check("statusline cost: avoidable turns yellow above avoidable_warn_pct", "\x1b[33mavoidable $" in out, repr(out))
+cfg_path.write_text(json.dumps({"avoidable_warn_pct": 99}))
+rc, out, _ = cost_sl("cost-1", p1, raw=True)
+check("statusline cost: and stays plain below it", " avoidable $" in out and "\x1b[33mavoidable" not in out, repr(out))
+cfg_path.unlink()
+
+warm_only = b"".join(line(resp(f"w{k}", NOW - 3000 + 30 * k, O, 30000 if k == 0 else 1000, 0 if k == 0 else 29000 + 1000 * k))
+                     for k in range(6))
+p6 = write_session("cost-6", warm_only, {})
+rc, out, _ = cost_sl("cost-6", p6)
+check("statusline cost: no avoidable rebuilds leaves avoidable out", "cost $" in out and "saved $" in out
+      and "avoidable" not in out, out)
+p7 = write_session("cost-7", b"".join(line(resp(f"u{k}", NOW - 3000 + 30 * k, MYST, 1000, 30000 * k)) for k in range(4)), {})
+rc, out, _ = cost_sl("cost-7", p7)
+check("statusline cost: nothing priced leaves the block out", rc == 0 and "cost" not in out and "misses 0" in out, out)
+
+cfg_path.write_text(json.dumps({"statusline_cost": False}))
+rc, out, _ = cost_sl("cost-1", p1)
+st = json.loads((STATE / "cost-1.json").read_text())
+check("statusline cost: statusline_cost=false turns it off", "cost $" not in out and "misses 0" in out
+      and "costs" not in st, out)
+cfg_path.unlink()
+
+rc, out, err = cost_sl("cost-err", p1, pre="cg.session_costs = lambda *a, **k: 1 / 0")
+check("statusline cost: an error prints the line without the block", rc == 0 and "misses 0" in out
+      and "cost" not in out and "tip:" in out and not err, out + err)
+STATE.joinpath("cost-bad.json").write_text(json.dumps({"transcript_path": str(p1), "costs": {
+    "path": str(p1), "prices": None, "main": "junk", "subs": [1], "shown": {"cost": "x"}}}))
+rc, out, err = cost_sl("cost-bad", p1)
+rc2, out2, _ = cost_sl("cost-bad", p1)
+check("statusline cost: a corrupt state never breaks the line and recovers", rc == 0 and rc2 == 0
+      and "misses 0" in out and agrees(money(out2), ref1), out + err + out2)
+
 # ---------------- trim hook
 big = "\n".join([f"line {i}" for i in range(3000)] + ["ERROR: something broke at foo.py:12"] +
                 [f"tail {i}" for i in range(100)])

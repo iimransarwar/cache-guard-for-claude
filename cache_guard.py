@@ -3,7 +3,7 @@
 cache-guard: keep your Claude Code prompt cache warm and your token use low.
 
 Commands
-  statusline          Two-line status bar: cache + usage-limit stats, and a tip for the moment.
+  statusline          Two-line status bar: cache, session cost and usage-limit stats, and a tip.
   doctor              Scan your setup for things that silently break the cache or waste tokens.
   report [SESSION]    Cache stats for a session: totals, cost, real cache misses, and its subagents.
                       SESSION = session id or .jsonl path; default = latest session in this folder.
@@ -32,6 +32,7 @@ They never inject text into Claude's context, so they can't break the cache them
 
 Needs Python 3.8+ and Claude Code v2.1.251+ (v2.1.260+ for miss causes). No dependencies.
 """
+import hashlib
 import json
 import os
 import re
@@ -65,6 +66,8 @@ DEFAULT_CONFIG = {
     "cold_prompt_warn_tokens": 100000,  # only when the message would re-read at least this much
     "cold_prompt_confirm_seconds": 120,
     "pricing": {},               # override or add list prices: {"model-id-prefix": [in, 5m, 1h, read, out]}
+    "statusline_cost": True,     # show session cost, avoidable cost and cache savings on the status line
+    "avoidable_warn_pct": 15,    # colour the avoidable figure from this share of the session's cost
     "cause_tip_seconds": 600,
     "trim": {
         "max_chars": 12000,      # only trim output longer than this
@@ -173,7 +176,10 @@ def load_state(session_id):
 def save_state(session_id, data):
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        state_path(session_id).write_text(json.dumps(data))
+        path = state_path(session_id)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, path)  # a hook reading at the same moment sees the old file or the new one, never half
     except Exception:
         pass
 
@@ -196,6 +202,11 @@ def fmt_usd(x):
     if x is None:
         return "?"
     return f"${x:,.0f}" if x >= 100 else f"${x:.2f}"
+
+
+def fmt_signed_usd(x):
+    s = fmt_usd(abs(x))
+    return f"-{s}" if x < 0 and s != "$0.00" else s
 
 
 def fmt_gap(seconds):
@@ -351,6 +362,8 @@ def cmd_statusline():
                   "recache_tokens_if_cold": recache, "model": model, "model_id": model_id,
                   "caching_observed": bool(pc.get("caching_observed", True)), "updated": now})
 
+    cost_txt = cost_block(cfg, state)
+
     # optional desktop alert, once per expiry time
     if (cfg.get("notify") and mins_left is not None and mins_left < cfg["notify_minutes"]
             and state.get("notified_for") != exp):
@@ -366,7 +379,7 @@ def cmd_statusline():
         cache_txt = f"{colour}warm{left}{RST}"
     else:
         cache_txt = f"{RED}{BOLD}COLD{RST}"
-    line1 = f"{model} | cache {pct} ({cache_txt}, ttl {ttl}) | misses {misses}{limits_txt}"
+    line1 = f"{model} | cache {pct} ({cache_txt}, ttl {ttl}){cost_txt} | misses {misses}{limits_txt}"
     if not warm and recache:
         usd, _ = cold_cost(cfg, model_id, recache, ttl)
         line1 += f" | next msg re-reads ~{fmt_tokens(recache)}" + (f" (~{fmt_usd(usd)})" if usd else "")
@@ -818,58 +831,85 @@ def parse_ts(s):
         return None
 
 
+def digest(data, size=5):
+    return hashlib.blake2b(data, digest_size=size).hexdigest()
+
+
+def key_digest(key):
+    return digest(json.dumps(key).encode())
+
+
+class RequestReader:
+    """Turns transcript lines into one row per API response, in order. load_requests feeds it a whole
+    file; the status line feeds it only the lines appended since its last run."""
+
+    def __init__(self, sidechain=False):
+        self.sidechain = sidechain
+        self.reqs, self.keys, self.index = [], [], {}
+        self.compact_pending, self.signals = False, set()
+        self.folded = set()  # status line: digests of requests already added to its running totals
+        self.stale = False   # status line: a line re-logged one of those, so the file must be read again
+
+    def feed(self, line):
+        if ('"usage"' not in line and '"compact_boundary"' not in line
+                and '"isCompactSummary"' not in line and not any(s in line for s in SIGNALS)):
+            return  # skip the bulk of the file without parsing it
+        try:
+            rec = json.loads(line)
+        except Exception:
+            return
+        if not isinstance(rec, dict) or (rec.get("isSidechain") and not self.sidechain):
+            return
+        typ = rec.get("type")
+        if (typ == "system" and rec.get("subtype") == "compact_boundary") or rec.get("isCompactSummary"):
+            self.compact_pending = True
+            return
+        if typ == "attachment":
+            kind = (rec.get("attachment") or {}).get("type")
+            if kind in SIGNALS:
+                self.signals.add(kind)
+            return
+        msg = rec.get("message")
+        u = msg.get("usage") if isinstance(msg, dict) else None
+        if typ != "assistant" or not isinstance(u, dict) or msg.get("model") == "<synthetic>":
+            return
+        cc = u.get("cache_creation") or {}
+        row = {
+            "ts": parse_ts(rec.get("timestamp")), "model": msg.get("model") or "?",
+            "inp": int(u.get("input_tokens") or 0),
+            "write": int(u.get("cache_creation_input_tokens") or 0),
+            "w5": int(cc.get("ephemeral_5m_input_tokens") or 0),
+            "w1": int(cc.get("ephemeral_1h_input_tokens") or 0),
+            "read": int(u.get("cache_read_input_tokens") or 0),
+            "out": int(u.get("output_tokens") or 0),
+            "after_compact": self.compact_pending, "signals": self.signals,
+        }
+        key = msg.get("id") or rec.get("requestId") or rec.get("uuid")
+        if key in self.index:  # a streamed response is logged more than once; the last line has the full usage
+            old = self.reqs[self.index[key]]
+            row["after_compact"], row["signals"] = old["after_compact"], old["signals"]
+            self.reqs[self.index[key]] = row
+            return
+        if self.folded and key_digest(key) in self.folded:
+            self.stale = True
+            return
+        self.index[key] = len(self.reqs)
+        self.reqs.append(row)
+        self.keys.append(key)
+        self.compact_pending, self.signals = False, set()
+
+
 def load_requests(path, sidechain=False):
     """One row per API response in a transcript, in order. sidechain=True reads a subagent's own file."""
-    reqs, index, compact_pending, signals = [], {}, False, set()
+    reader = RequestReader(sidechain)
     try:
         f = open(path, encoding="utf-8", errors="ignore")
     except Exception:
-        return reqs
+        return reader.reqs
     with f:
         for line in f:
-            if ('"usage"' not in line and '"compact_boundary"' not in line
-                    and '"isCompactSummary"' not in line and not any(s in line for s in SIGNALS)):
-                continue  # skip the bulk of the file without parsing it
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            if not isinstance(rec, dict) or (rec.get("isSidechain") and not sidechain):
-                continue
-            typ = rec.get("type")
-            if (typ == "system" and rec.get("subtype") == "compact_boundary") or rec.get("isCompactSummary"):
-                compact_pending = True
-                continue
-            if typ == "attachment":
-                kind = (rec.get("attachment") or {}).get("type")
-                if kind in SIGNALS:
-                    signals.add(kind)
-                continue
-            msg = rec.get("message")
-            u = msg.get("usage") if isinstance(msg, dict) else None
-            if typ != "assistant" or not isinstance(u, dict) or msg.get("model") == "<synthetic>":
-                continue
-            cc = u.get("cache_creation") or {}
-            row = {
-                "ts": parse_ts(rec.get("timestamp")), "model": msg.get("model") or "?",
-                "inp": int(u.get("input_tokens") or 0),
-                "write": int(u.get("cache_creation_input_tokens") or 0),
-                "w5": int(cc.get("ephemeral_5m_input_tokens") or 0),
-                "w1": int(cc.get("ephemeral_1h_input_tokens") or 0),
-                "read": int(u.get("cache_read_input_tokens") or 0),
-                "out": int(u.get("output_tokens") or 0),
-                "after_compact": compact_pending, "signals": signals,
-            }
-            key = msg.get("id") or rec.get("requestId") or rec.get("uuid")
-            if key in index:  # a streamed response is logged more than once; the last line has the full usage
-                old = reqs[index[key]]
-                row["after_compact"], row["signals"] = old["after_compact"], old["signals"]
-                reqs[index[key]] = row
-                continue
-            index[key] = len(reqs)
-            reqs.append(row)
-            compact_pending, signals = False, set()
-    return reqs
+            reader.feed(line)
+    return reader.reqs
 
 
 def subagent_files(path):
@@ -939,44 +979,53 @@ def total_cost(s):
     return sum(s["cost"].values())
 
 
+def rebuild_step(prev, r, ttl):
+    """find_rebuilds for one request: (the rebuild it is, or None; the cache TTL carried to the next one)."""
+    if prev is None:
+        return ({"req": r, "kind": "start", "tokens": r["write"], "cause": "session start"}
+                if r["write"] else None), ttl
+    ttl = 3600 if prev["w1"] else 300 if prev["w5"] else ttl
+    if r["after_compact"]:
+        return {"req": r, "kind": "compaction", "tokens": r["write"], "cause": "after compaction"}, ttl
+    expected = prev["read"] + prev["write"]
+    tokens = min(expected - r["read"], r["write"] + r["inp"])
+    if tokens < max(MISS_MIN_TOKENS, MISS_MIN_FRACTION * expected):
+        return None, ttl
+    gap = (r["ts"] - prev["ts"]) if (r["ts"] and prev["ts"]) else None
+    if r["model"] != prev["model"]:
+        kind, cause = "model", f"model switch ({prev['model']} → {r['model']})"
+    elif gap and ttl and gap > ttl:
+        kind, cause = "idle", f"idle {fmt_gap(gap)} (cache expired, ttl {'1h' if ttl == 3600 else '5m'})"
+    elif gap and not ttl and gap > 3600:
+        kind, cause = "idle", f"idle {fmt_gap(gap)} (cache expired)"
+    elif gap and not ttl and gap > 300:
+        kind, cause = "idle", f"idle {fmt_gap(gap)} (expired if on 5m TTL)"
+    elif r["signals"] & set(SIGNALS_RESTART):
+        kind, cause = "restart", KIND_LABELS["restart"]
+    elif r["signals"] & set(SIGNALS_TOOLS):
+        kind, cause = "tools", KIND_LABELS["tools"]
+    else:
+        kind, cause = "unknown", "prefix changed (cause not in transcript; /usage may know)"
+    return {"req": r, "kind": kind, "tokens": tokens, "cause": cause}, ttl
+
+
+def rebuild_usd(x, table):
+    r = x["req"]
+    p = price_for(table, r["model"], r["inp"] + r["write"] + r["read"])
+    return x["tokens"] * (p[2] if r["w1"] > r["w5"] else p[1]) / 1e6 if p else None
+
+
 def find_rebuilds(reqs, table):
     """Requests that re-wrote cache they should have read. A big write alone is not a rebuild:
     the cached prefix has to shrink, the same test Claude Code's own miss counter uses."""
-    out, ttl = [], None
-    for i, r in enumerate(reqs):
-        prev = reqs[i - 1] if i else None
-        if prev is None:
-            if r["write"]:
-                out.append({"req": r, "kind": "start", "tokens": r["write"], "cause": "session start"})
-            continue
-        ttl = 3600 if prev["w1"] else 300 if prev["w5"] else ttl
-        if r["after_compact"]:
-            out.append({"req": r, "kind": "compaction", "tokens": r["write"], "cause": "after compaction"})
-            continue
-        expected = prev["read"] + prev["write"]
-        tokens = min(expected - r["read"], r["write"] + r["inp"])
-        if tokens < max(MISS_MIN_TOKENS, MISS_MIN_FRACTION * expected):
-            continue
-        gap = (r["ts"] - prev["ts"]) if (r["ts"] and prev["ts"]) else None
-        if r["model"] != prev["model"]:
-            kind, cause = "model", f"model switch ({prev['model']} → {r['model']})"
-        elif gap and ttl and gap > ttl:
-            kind, cause = "idle", f"idle {fmt_gap(gap)} (cache expired, ttl {'1h' if ttl == 3600 else '5m'})"
-        elif gap and not ttl and gap > 3600:
-            kind, cause = "idle", f"idle {fmt_gap(gap)} (cache expired)"
-        elif gap and not ttl and gap > 300:
-            kind, cause = "idle", f"idle {fmt_gap(gap)} (expired if on 5m TTL)"
-        elif r["signals"] & set(SIGNALS_RESTART):
-            kind, cause = "restart", KIND_LABELS["restart"]
-        elif r["signals"] & set(SIGNALS_TOOLS):
-            kind, cause = "tools", KIND_LABELS["tools"]
-        else:
-            kind, cause = "unknown", "prefix changed (cause not in transcript; /usage may know)"
-        out.append({"req": r, "kind": kind, "tokens": tokens, "cause": cause})
+    out, ttl, prev = [], None, None
+    for r in reqs:
+        x, ttl = rebuild_step(prev, r, ttl)
+        if x:
+            out.append(x)
+        prev = r
     for x in out:
-        r = x["req"]
-        p = price_for(table, r["model"], r["inp"] + r["write"] + r["read"])
-        x["usd"] = x["tokens"] * (p[2] if r["w1"] > r["w5"] else p[1]) / 1e6 if p else None
+        x["usd"] = rebuild_usd(x, table)
     return out
 
 
@@ -1191,6 +1240,237 @@ def cmd_report(args):
         report_all(days)
     else:
         report_session(args[0] if args else None)
+
+
+# ------------------------------------------------------------------ session cost (status line)
+COST_BUDGET_SECONDS = 0.5   # most time one status-line run spends reading transcripts; the rest waits for the next
+COST_READ_BLOCK = 4 << 20   # bytes read at a time
+COST_TAIL = 8               # newest requests kept open, because a streamed response is logged again under its id
+HEAD_BYTES = 4096           # start of a transcript remembered, to notice the file was replaced
+NEWLINES = re.compile(r"\r\n|\r|\n")
+
+
+def cache_saving(r, table):
+    """What caching saved on one request at list price: its cache reads at the plain input price less what they
+    cost, minus the premium its cache writes paid over the input price. None when the model has no price."""
+    p = price_for(table, r["model"], r["inp"] + r["write"] + r["read"])
+    if not p:
+        return None
+    w5, w1 = r["w5"], r["w1"]
+    if w5 + w1 == 0:
+        w5 = r["write"]  # as req_cost: no split recorded means the 5m rate
+    return (r["read"] * (p[0] - p[3]) - w5 * (p[1] - p[0]) - w1 * (p[2] - p[0])) / 1e6
+
+
+def new_tally():
+    return {"reqs": 0, "unpriced": 0, "cost": {"read": 0.0, "write": 0.0, "input": 0.0, "output": 0.0},
+            "saved": 0.0, "avoidable": 0.0, "prev": None, "ttl": None}
+
+
+def tally_add(t, r, table, main):
+    """Add one request to running totals, with the same arithmetic, in the same order, as summarise and find_rebuilds."""
+    t["reqs"] += 1
+    c = req_cost(r, table)
+    if c is None:
+        t["unpriced"] += 1
+    else:
+        for k in c:
+            t["cost"][k] += c[k]
+        t["saved"] += cache_saving(r, table)
+    if main:  # rebuilds are judged in the main conversation only, as report lists them
+        x, t["ttl"] = rebuild_step(t["prev"], r, t["ttl"])
+        if x and x["kind"] not in EXPECTED:
+            usd = rebuild_usd(x, table)
+            if usd is not None:
+                t["avoidable"] += usd
+        t["prev"] = r
+
+
+def row_out(r):
+    return dict(r, signals=sorted(r["signals"])) if r else None
+
+
+def row_in(d):
+    return dict(d, signals=set(d["signals"])) if d else None
+
+
+def new_track():
+    return {"off": 0, "ino": None, "stamp": None, "hl": 0, "head": digest(b"", 16), "rows": [], "keys": [],
+            "cp": False, "sig": [], "folded": "", "tally": new_tally(), "fig": None}
+
+
+def text_lines(data):
+    """Bytes to lines split as a text-mode file splits them, so this reader and load_requests see the same lines."""
+    text = data.decode("utf-8", "ignore")
+    return NEWLINES.split(text) if "\r" in text else text.split("\n")
+
+
+def track_continues(st, path, s):
+    """True when this is the file read last time, with lines only appended to it since."""
+    if st.get("ino") != s.st_ino or s.st_size < st["off"]:
+        return False  # replaced, or shrank
+    if st["stamp"] and s.st_size == st["stamp"][1]:
+        return False  # same size but touched since: rewritten in place
+    if not st["off"]:
+        return True
+    with open(path, "rb") as f:
+        head = f.read(st["hl"])
+        f.seek(st["off"] - 1)
+        return f.read(1) == b"\n" and digest(head, 16) == st["head"]
+
+
+def read_appended(path, off, reader, deadline, ran):
+    """Feed the reader every complete line after byte `off` until end of file or the time budget. Returns the offset
+    after the last complete line and the bytes after it at end of file, or None for those when time ran out first.
+    The first block of a run is always read, so a run out of time still makes progress."""
+    with open(path, "rb") as f:
+        f.seek(off)
+        partial = []
+        while not reader.stale:
+            if ran[0] and time.monotonic() > deadline:
+                return off, None
+            block = f.read(COST_READ_BLOCK)
+            if not block:
+                return off, b"".join(partial)
+            cut = block.rfind(b"\n") + 1
+            if not cut:
+                partial.append(block)  # a line longer than a block
+                continue
+            partial.append(block[:cut])
+            data, partial = b"".join(partial), [block[cut:]]
+            for line in text_lines(data):
+                reader.feed(line)
+            off += len(data)
+            ran[0] = True
+    return off, None
+
+
+def advance_track(st, path, main, table, deadline, ran):
+    """Bring one transcript's running totals up to date. Returns (its state, whether it reached the end)."""
+    try:
+        s = os.stat(path)
+    except OSError:
+        return None, True  # not there (yet): nothing to count
+    stamp = [s.st_ino, s.st_size, s.st_mtime_ns]
+    if st and st["stamp"] == stamp:
+        return st, True  # unchanged since the last run
+    if not (st and track_continues(st, path, s)):
+        st = new_track()
+    while True:
+        reader = RequestReader(sidechain=not main)
+        reader.reqs = [row_in(x) for x in st["rows"]]
+        reader.keys = list(st["keys"])
+        reader.index = {k: i for i, k in enumerate(reader.keys)}
+        reader.compact_pending, reader.signals = bool(st["cp"]), set(st["sig"])
+        folded = st["folded"]
+        reader.folded = {folded[i:i + 10] for i in range(0, len(folded), 10)}
+        tally = dict(st["tally"], cost=dict(st["tally"]["cost"]), prev=row_in(st["tally"]["prev"]))
+        off, rest = read_appended(path, st["off"], reader, deadline, ran)
+        if reader.stale:  # a request already counted was logged again: count this file from the start
+            st = new_track()
+            continue
+        # all but the newest requests join the running totals; those stay open to a line that re-logs them
+        n = max(0, len(reader.reqs) - COST_TAIL)
+        done_keys = [key_digest(k) for k in reader.keys[:n]]
+        for r in reader.reqs[:n]:
+            tally_add(tally, r, table, main)
+        reader.reqs, reader.keys = reader.reqs[n:], reader.keys[n:]
+        reader.index = {k: i for i, k in enumerate(reader.keys)}
+        reader.folded.update(done_keys)
+        hl, head = st["hl"], st["head"]
+        if hl < HEAD_BYTES and off > hl:
+            hl = min(off, HEAD_BYTES)
+            with open(path, "rb") as f:
+                head = digest(f.read(hl), 16)
+        kept = {"off": off, "ino": s.st_ino, "stamp": None, "hl": hl, "head": head,
+                "rows": [row_out(r) for r in reader.reqs], "keys": list(reader.keys),
+                "cp": reader.compact_pending, "sig": sorted(reader.signals), "folded": folded + "".join(done_keys),
+                "tally": dict(tally, prev=row_out(tally["prev"])), "fig": None}
+        if rest is None:
+            return kept, False  # out of time: carry on from `off` next run
+        for line in text_lines(rest) if rest else ():
+            reader.feed(line)  # a last line still without its newline counts now, and is read again next run
+        if reader.stale:
+            st = new_track()
+            continue
+        fig = dict(tally, cost=dict(tally["cost"]))
+        for r in reader.reqs:
+            tally_add(fig, r, table, main)
+        kept["fig"] = {k: fig[k] for k in ("reqs", "unpriced", "cost", "saved", "avoidable")}
+        kept["stamp"] = stamp
+        return kept, True
+
+
+def combine_tracks(main, subs):
+    """Session figures from the per-file totals, added up in the order report adds them. None when nothing is priced."""
+    figs = [t["fig"] for t in [main] + subs if t]
+    if not sum(f["reqs"] - f["unpriced"] for f in figs):
+        return None
+    sub = {"read": 0.0, "write": 0.0, "input": 0.0, "output": 0.0}
+    for t in subs:
+        if t:
+            for k in sub:
+                sub[k] += t["fig"]["cost"][k]
+    m = main["fig"] if main else new_tally()
+    return {"cost": sum(m["cost"].values()) + sum(sub.values()), "avoidable": m["avoidable"],
+            "saved": m["saved"] + sum(t["fig"]["saved"] for t in subs if t)}
+
+
+def session_costs(state, path, cfg):
+    """Cost, avoidable cost and cache savings of a session at list price, kept as running totals in its state and
+    brought up to date from what its transcripts gained since the last run. Returns the last complete figures, so a
+    run that runs out of time shows those; None before the first complete run, or when nothing can be priced."""
+    deadline = time.monotonic() + COST_BUDGET_SECONDS
+    table = price_table(cfg)
+    prices = digest(json.dumps([VERSION, table, sorted(LARGE_PROMPT.items())]).encode(), 16)
+    cs = state.get("costs")
+    if not (isinstance(cs, dict) and cs.get("path") == str(path) and cs.get("prices") == prices):
+        cs = state["costs"] = {"path": str(path), "prices": prices, "main": None, "subs": {}, "shown": None}
+    ran = [False]
+    cs["main"], done = advance_track(cs["main"], path, True, table, deadline, ran)
+    base, old, subs = path.parent / path.stem, cs["subs"], []
+    cs["subs"] = {}
+    for f in subagent_files(path):
+        rel = str(f.relative_to(base))
+        st, ok = advance_track(old.get(rel), f, False, table, deadline, ran)
+        done = done and ok
+        if st:
+            cs["subs"][rel] = st
+        subs.append(st)
+    if done:
+        cs["shown"] = combine_tracks(cs["main"], subs)
+    return cs["shown"]
+
+
+def cost_block(cfg, state):
+    """' | cost $x · avoidable $y · saved $z' for the first status line, or '' when it is turned off, nothing can be
+    priced yet, or anything at all goes wrong: the status line must always print."""
+    on = cfg.get("statusline_cost", True)
+    if on is False or str(on).strip().lower() in ("false", "0", "off", "no", "none"):
+        state.pop("costs", None)
+        return ""
+    try:
+        tp = state.get("transcript_path")
+        figs = session_costs(state, Path(tp), cfg) if tp else None
+    except Exception:
+        state.pop("costs", None)  # start afresh next run
+        return ""
+    try:
+        if not figs:
+            return ""
+        cost, avoid = float(figs["cost"]), float(figs["avoidable"])
+        parts = [f"cost {fmt_usd(cost)}"]
+        if fmt_usd(avoid) != "$0.00":
+            try:
+                warn = float(cfg.get("avoidable_warn_pct", 15))
+            except Exception:
+                warn = 15.0
+            txt = f"avoidable {fmt_usd(avoid)}"
+            parts.append(f"{YEL}{txt}{RST}" if cost > 0 and 100 * avoid / cost >= warn else txt)
+        parts.append(f"saved {fmt_signed_usd(float(figs['saved']))}")
+        return " | " + " · ".join(parts)
+    except Exception:
+        return ""
 
 
 # ------------------------------------------------------------------ install

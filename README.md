@@ -32,9 +32,17 @@ Install backs up `~/.claude/settings.json` first, keeps your own hooks, and repl
 **Status line** (two lines, refreshes every 30s)
 
 ```
-Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | misses 1 | 5h 42% 7d 18%
+Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cost $12.40 · avoidable $1.90 · saved $48.10 | misses 1 | 5h 42% 7d 18%
 tip: Last miss: tool definitions changed. Leave MCP servers and plugins alone until a break.
 ```
+
+The three money figures are for the current session at API list prices. On a subscription they show relative size, not a bill.
+
+- **cost**: what the session has cost so far, main conversation plus its subagents. It is the same total `report <session>` gives (its two Cost lines added together).
+- **avoidable**: the part of that cost spent re-writing cache that should have been read. That is every rebuild `report` lists under Cache misses (idle past the cache TTL, a model switch, a resume or restart, changed tools, or a prefix change with no cause in the transcript), at the price `report` shows for each. Session start and after-compaction writes are expected and not counted. Like the report, it covers the main conversation. It turns yellow at `avoidable_warn_pct` of the cost (default 15%) and is left out while it is $0.00.
+- **saved**: what caching has saved. For every request, main and subagents, it is what the cache reads would have cost at the plain input price, minus what was paid for cache reads and writes: (read tokens × (input price − read price)) − (write tokens × (write price − input price)), at that request's model prices and 5m or 1h write price. Early in a session it can be negative, because writes are paid before reads pay them back.
+
+Requests on models without a price are left out of all three, as in `report`. If nothing in the session can be priced, the block is left out. The status line keeps running totals in its state file and reads only what the transcripts gained since the last refresh. It spends at most half a second reading per refresh. If a refresh runs out of time (the first one on a very large session, for example), it shows the last figures it had, or none yet, and carries on at the next refresh. An error leaves the block out, never the line. Turn it off with `statusline_cost`.
 
 The tip is the most urgent of these:
 
@@ -101,6 +109,8 @@ Thresholds live in `~/.claude/cache-guard/config.json`:
 | `cold_prompt_warn_tokens` | 100000 | Smallest history the cold-message guard acts on |
 | `cold_prompt_confirm_seconds` | 120 | Window to send a stopped message again |
 | `pricing` | {} | Price overrides, per million tokens: `{"model-id-prefix": [input, 5m write, 1h write, cache read, output]}` |
+| `statusline_cost` | true | Show session cost, avoidable cost and cache savings on the status line |
+| `avoidable_warn_pct` | 15 | Avoidable share of the session's cost (%) at which that figure turns yellow |
 | `trim.max_chars` | 12000 | Only trim output longer than this |
 | `trim.head_lines`, `trim.tail_lines` | 30, 60 | Lines kept at the start and end |
 | `trim.max_error_lines` | 80 | Most error lines kept from the middle |
@@ -116,7 +126,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ## Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 72 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 95 checks against a throwaway HOME
 ```
 
 ## Caveats
