@@ -129,6 +129,8 @@ TIPS = [
     "Run `cache_guard.py doctor` to find settings that silently break your cache.",
     "Run `cache_guard.py report` after a session to see which moments rebuilt the cache.",
     "Hooks that inject text on every tool call can break the cache. doctor flags them.",
+    "cache cut $A → $B: $A is what re-sending your history every turn would cost at full price. "
+    "The cache bills those repeats at about 5%.",
 ]
 
 CAUSE_TIPS = {
@@ -205,9 +207,17 @@ def fmt_usd(x):
     return f"${x:,.0f}" if x >= 100 else f"${x:.2f}"
 
 
-def fmt_signed_usd(x):
-    s = fmt_usd(abs(x))
-    return f"-{s}" if x < 0 and s != "$0.00" else s
+def fmt_compact_usd(x):
+    return f"${x / 1000:.1f}k" if x >= 1000 else fmt_usd(x)
+
+
+def cut_text(cost, saved):
+    """'cache cut $before → $after (-N%)': what the requests would have cost without the cache, then what they cost.
+    Before the cache's writes have paid for themselves, say that instead of showing a cut of nothing."""
+    before = cost + saved
+    if saved <= 0 or fmt_usd(before) == fmt_usd(cost):
+        return f"cost {fmt_usd(cost)} · cache not paid back yet"
+    return f"cache cut {fmt_usd(before)} → {fmt_usd(cost)} (-{round(100 * saved / before)}%)"
 
 
 def fmt_gap(seconds):
@@ -1509,7 +1519,7 @@ def cost_block(cfg, state):
         if not figs:
             return ""
         cost, avoid = float(figs["cost"]), float(figs["avoidable"])
-        parts = [f"cost {fmt_usd(cost)}"]
+        parts = [cut_text(cost, float(figs["saved"]))]
         if fmt_usd(avoid) != "$0.00":
             try:
                 warn = float(cfg.get("avoidable_warn_pct", 15))
@@ -1517,7 +1527,6 @@ def cost_block(cfg, state):
                 warn = 15.0
             txt = f"avoidable {fmt_usd(avoid)}"
             parts.append(f"{YEL}{txt}{RST}" if cost > 0 and 100 * avoid / cost >= warn else txt)
-        parts.append(f"saved {fmt_signed_usd(float(figs['saved']))}")
         return " | " + " · ".join(parts)
     except Exception:
         return ""

@@ -311,7 +311,8 @@ STATE = HOME / ".claude" / "cache-guard" / "state"
 cdir = HOME / ".claude" / "projects" / "-cost-tests"  # its own folder, so the report tests above are unaffected
 cdir.mkdir(parents=True, exist_ok=True)
 O, S, H, MYST = "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-mystery-1"
-MONEY = re.compile(r"\| cost (\$[\d,.]+)(?: · avoidable (\$[\d,.]+))? · saved (-?\$[\d,.]+) \|")
+MONEY = re.compile(r"\| (?:cache cut (\$[\d,.]+) → (\$[\d,.]+) \(-\d+%\)|cost (\$[\d,.]+) · cache not paid back yet)"
+                   r"(?: · avoidable (\$[\d,.]+))? \|")
 
 # A full read with the report's own functions. Saved is restated here from its definition, not taken from the script.
 REF = r'''
@@ -362,12 +363,18 @@ def usd(s):
 
 def money(out):
     m = MONEY.search(out.splitlines()[0] if out.strip() else "")
-    return m and {"cost": usd(m.group(1)), "avoidable": usd(m.group(2)), "saved": usd(m.group(3)), "text": m.group(0)}
+    return m and {"cost": usd(m.group(2) or m.group(3)), "avoidable": usd(m.group(4)),
+                  "before": usd(m.group(1)) if m.group(1) else None, "text": m.group(0)}
 
 
 def agrees(fig, ref):
-    """Printed figures match a full read to the cent (fmt_usd rounds to cents below $100)."""
-    return bool(fig) and all(abs(fig[k] - ref[k]) <= 0.0051 for k in ("cost", "avoidable", "saved"))
+    """Printed figures match a full read to the cent (fmt_usd rounds to cents below $100). The cost before the cache
+    is cost + saved; with no before figure the line says the cache has not paid back yet, so saved must be about 0 or less."""
+    if not fig or not all(abs(fig[k] - ref[k]) <= 0.0051 for k in ("cost", "avoidable")):
+        return False
+    if fig["before"] is None:
+        return ref["saved"] <= 0.005
+    return abs(fig["before"] - (ref["cost"] + ref["saved"])) <= 0.0051
 
 
 def exact(sid, ref):
@@ -466,7 +473,8 @@ ref1 = reference(p1)
 rc, out, err = cost_sl("cost-1", p1)
 fig = money(out)
 check("statusline cost: block sits between the cache and misses parts", rc == 0 and bool(fig)
-      and re.search(r"\(warm, \d+m left, ttl 1h\) \| cost \$[\d.]+ · avoidable \$[\d.]+ · saved -?\$[\d.]+ \| misses 0",
+      and re.search(r"\(warm, \d+m left, ttl 1h\) \| (cache cut \$[\d.,]+ → \$[\d.,]+ \(-\d+%\)|cost \$[\d.,]+ · cache not paid "
+                              r"back yet) · avoidable \$[\d.]+ \| misses 0",
                     out) is not None, out + err)
 rc, rep, err = run(["report", str(p1)])
 costs = re.findall(r"Cost\s+\$([\d,.]+)\s+at API list price", rep)
@@ -576,8 +584,16 @@ warm_only = b"".join(line(resp(f"w{k}", NOW - 3000 + 30 * k, O, 30000 if k == 0 
                      for k in range(6))
 p6 = write_session("cost-6", warm_only, {})
 rc, out, _ = cost_sl("cost-6", p6)
-check("statusline cost: no avoidable rebuilds leaves avoidable out", "cost $" in out and "saved $" in out
+check("statusline cost: no avoidable rebuilds leaves avoidable out", "cache cut $" in out
       and "avoidable" not in out, out)
+p8 = write_session("cost-8", line(resp("s0", NOW - 60, O, 40000, 0)), {})  # one write, no reads: saved < 0
+rc, out, _ = cost_sl("cost-8", p8)
+check("statusline cost: before the cache pays back it says so",
+      "| cost $" in out and "· cache not paid back yet" in out and "cache cut" not in out.splitlines()[0], out)
+tips = json.loads(subprocess.run([sys.executable, "-B", "-c", "import sys, json; sys.path.insert(0, sys.argv[1]); "
+                                  "import cache_guard as cg; print(json.dumps(cg.TIPS))", str(ROOT)],
+                                 capture_output=True, text=True, env=ENV).stdout or "[]")
+check("statusline cost: a tip explains cache cut", any("cache cut" in t and "5%" in t for t in tips), json.dumps(tips))
 p7 = write_session("cost-7", b"".join(line(resp(f"u{k}", NOW - 3000 + 30 * k, MYST, 1000, 30000 * k)) for k in range(4)), {})
 rc, out, _ = cost_sl("cost-7", p7)
 check("statusline cost: nothing priced leaves the block out", rc == 0 and "cost" not in out and "misses 0" in out, out)
