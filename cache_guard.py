@@ -219,11 +219,14 @@ def fmt_compact_usd(x):
 
 def cut_text(cost, saved):
     """'cache cut $before → $after (-N%)': what the requests would have cost without the cache, then what they cost.
-    Before the cache's writes have paid for themselves, say that instead of showing a cut of nothing."""
-    before = cost + saved
-    if saved <= 0 or fmt_usd(before) == fmt_usd(cost):
+    While the cache's writes haven't paid for themselves yet, say so; with no caching at all, just the cost."""
+    if saved < 0:
         return f"cost {fmt_usd(cost)} · cache not paid back yet"
-    return f"cache cut {fmt_usd(before)} → {fmt_usd(cost)} (-{round(100 * saved / before)}%)"
+    if saved == 0:
+        return f"cost {fmt_usd(cost)}"
+    before = cost + saved
+    pct = round(100 * saved / before)
+    return f"cache cut {fmt_usd(before)} → {fmt_usd(cost)} ({f'-{pct}%' if pct >= 1 else '<1%'})"
 
 
 def fmt_gap(seconds):
@@ -1586,7 +1589,7 @@ def file_figures(path, sidechain, table):
     return cost, saved
 
 
-def scan_totals(cfg, now):
+def scan_totals(cfg, now, beat=None):
     """Cost and cache savings of every session report --all would cover, grouped by project folder. Figures per
     transcript are kept in TOTALS_FILES_PATH, so a file whose size and mtime are unchanged is not read again."""
     days = float(cfg.get("totals_days", 30))
@@ -1602,6 +1605,8 @@ def scan_totals(cfg, now):
         st = path.stat()
         e = old.get(str(path))
         if not (isinstance(e, dict) and e.get("size") == st.st_size and e.get("mtime_ns") == st.st_mtime_ns):
+            if beat:
+                beat()
             cost, saved = file_figures(path, sidechain, table)
             e = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "cost": cost, "saved": saved,
                  "cwd": None if sidechain else transcript_cwd(path)}
@@ -1635,15 +1640,31 @@ def scan_totals(cfg, now):
             "saved": sum(x["saved"] for x in out), "projects": out}
 
 
-def cmd_totals_refresh(args):
+def own_lock(token):
     try:
-        write_json_atomic(TOTALS_PATH, scan_totals(load_config(), time.time()))
-    finally:
-        if "--release-lock" in args:
-            try:
-                TOTALS_LOCK.unlink()
-            except Exception:
-                pass
+        return bool(token) and TOTALS_LOCK.read_text() == token
+    except Exception:
+        return False
+
+
+def cmd_totals_refresh(args):
+    """Scan and write TOTALS_PATH. With --lock TOKEN (as the status line starts it): keep that lock fresh while
+    reading, so no one takes it over from a live scan, and remove it on success only. A failed scan leaves it to go
+    stale, so the next attempt waits TOTALS_LOCK_STALE_SECONDS instead of re-reading everything every 30s."""
+    token = args[args.index("--lock") + 1] if "--lock" in args[:-1] else None
+    last = [0.0]
+
+    def beat():
+        if time.time() - last[0] >= 2 and own_lock(token):
+            last[0] = time.time()
+            os.utime(TOTALS_LOCK)
+
+    write_json_atomic(TOTALS_PATH, scan_totals(load_config(), time.time(), beat if token else None))
+    if own_lock(token):
+        try:
+            TOTALS_LOCK.unlink()
+        except Exception:
+            pass
 
 
 TOTALS_LOCK_STALE_SECONDS = 300  # a lock this old belongs to a scan that died; take it over
@@ -1706,9 +1727,14 @@ def maybe_spawn_refresh(cfg, now):
         if t is not None and totals_fresh(t, cfg, now):
             return
         GUARD_DIR.mkdir(parents=True, exist_ok=True)
+        token = os.urandom(8).hex()
         for attempt in (0, 1):
             try:
-                os.close(os.open(str(TOTALS_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                fd = os.open(str(TOTALS_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                try:
+                    os.write(fd, token.encode())
+                finally:
+                    os.close(fd)
                 break
             except FileExistsError:
                 if attempt or now - TOTALS_LOCK.stat().st_mtime <= TOTALS_LOCK_STALE_SECONDS:
@@ -1722,7 +1748,7 @@ def maybe_spawn_refresh(cfg, now):
         else:
             kw["start_new_session"] = True
         try:
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "totals-refresh", "--release-lock"], **kw)
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "totals-refresh", "--lock", token], **kw)
         except Exception:
             TOTALS_LOCK.unlink()
     except Exception:

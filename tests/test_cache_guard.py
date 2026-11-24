@@ -313,7 +313,7 @@ STATE = HOME / ".claude" / "cache-guard" / "state"
 cdir = HOME / ".claude" / "projects" / "-cost-tests"  # its own folder, so the report tests above are unaffected
 cdir.mkdir(parents=True, exist_ok=True)
 O, S, H, MYST = "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-mystery-1"
-MONEY = re.compile(r"\| (?:cache cut (\$[\d,.]+) → (\$[\d,.]+) \(-\d+%\)|cost (\$[\d,.]+) · cache not paid back yet)"
+MONEY = re.compile(r"\| (?:cache cut (\$[\d,.]+) → (\$[\d,.]+) \((?:-\d+%|<1%)\)|cost (\$[\d,.]+)(?: · cache not paid back yet)?)"
                    r"(?: · avoidable (\$[\d,.]+))? \|")
 
 # A full read with the report's own functions. Saved is restated here from its definition, not taken from the script.
@@ -595,6 +595,14 @@ check("statusline cost: before the cache pays back it says so",
 tips = json.loads(subprocess.run([sys.executable, "-B", "-c", "import sys, json; sys.path.insert(0, sys.argv[1]); "
                                   "import cache_guard as cg; print(json.dumps(cg.TIPS))", str(ROOT)],
                                  capture_output=True, text=True, env=ENV).stdout or "[]")
+CUT = ("import sys, json; sys.path.insert(0, sys.argv[1]); import cache_guard as cg; "
+       "print(json.dumps([cg.cut_text(*a) for a in json.loads(sys.argv[2])]))")
+cut_cases = [(12.4, 48.1), (5.00, 0.01), (100, 0.4), (12.4, 0), (12.4, -0.3)]
+got = json.loads(subprocess.run([sys.executable, "-B", "-c", CUT, str(ROOT), json.dumps(cut_cases)], capture_output=True,
+                                text=True, env=ENV).stdout or "[]")
+check("statusline cost: cache cut wording never says -0%, nor not-paid-back once it has",
+      got == ["cache cut $60.50 → $12.40 (-80%)", "cache cut $5.01 → $5.00 (<1%)", "cache cut $100 → $100 (<1%)",
+              "cost $12.40", "cost $12.40 · cache not paid back yet"], json.dumps(got))
 check("statusline cost: a tip explains cache cut", any("cache cut" in t and "5%" in t for t in tips), json.dumps(tips))
 p7 = write_session("cost-7", b"".join(line(resp(f"u{k}", NOW - 3000 + 30 * k, MYST, 1000, 30000 * k)) for k in range(4)), {})
 rc, out, _ = cost_sl("cost-7", p7)
@@ -707,9 +715,30 @@ rc, out, err = refresh()
 t, ok, why = totals_vs_full_read()
 check("totals: and counted once it is complete", rc == 0 and ok and t.get("cost", 0) > before, f"{out}{err}\n{why}")
 
-TOTALS_LOCK.write_text("")
-rc, out, err = refresh("", "--release-lock")
-check("totals: --release-lock removes the lock", rc == 0 and not TOTALS_LOCK.exists(), out + err)
+TOTALS_LOCK.write_text("other")
+rc, out, err = refresh("", "--lock", "mine")
+check("totals: a scan leaves a lock that isn't its own", rc == 0 and TOTALS_LOCK.read_text() == "other", out + err)
+TOTALS_LOCK.write_text("mine")
+rc, out, err = refresh("", "--lock", "mine")
+check("totals: a scan removes its own lock when done", rc == 0 and not TOTALS_LOCK.exists(), out + err)
+
+TOTALS_LOCK.write_text("tok")
+os.utime(TOTALS_LOCK, (NOW - 400, NOW - 400))
+with open(pb, "ab") as f:
+    f.write(line(resp("be-beat", NOW - 3, O, 500, 36000)))
+SEEN_LOCK = ("seen = []\nff = cg.file_figures\n"
+             "def watched(*a, **k):\n    seen.append(cg.TOTALS_LOCK.stat().st_mtime)\n    return ff(*a, **k)\n"
+             "cg.file_figures = watched\nimport atexit\natexit.register(lambda: print('LOCKAGE', time.time() - max(seen)))\n"
+             "import time\n")
+rc, out, err = refresh(SEEN_LOCK, "--lock", "tok")
+age = float(re.search(r"LOCKAGE (\S+)", out).group(1)) if "LOCKAGE" in out else 1e9
+check("totals: a running scan keeps its lock fresh", rc == 0 and age < 60, f"{age}\n{out}{err}")
+TOTALS_LOCK.write_text("tok")
+rc, out, err = refresh("cg.scan_totals = lambda *a, **k: 1 / 0", "--lock", "tok")
+check("totals: a failed scan keeps its lock, so it waits until the lock is stale",
+      rc != 0 and TOTALS_LOCK.exists() and TOTALS_LOCK.read_text() == "tok", out + err)
+TOTALS_LOCK.unlink()
+refresh()
 
 # the all-projects row
 def fmt(x):
@@ -792,7 +821,8 @@ check("totals: a lock older than 5 minutes is taken over", rc == 0 and wait_for(
 
 TOTALS_JSON.unlink(missing_ok=True)
 spawn_log = WORK / "spawns.log"
-stub = f"import pathlib\ncg.subprocess.Popen = lambda *a, **k: pathlib.Path({str(spawn_log)!r}).open('a').write('x\\n')\n"
+stub = (f"import pathlib, json\ncg.subprocess.Popen = lambda *a, **k: "
+        f"pathlib.Path({str(spawn_log)!r}).open('a').write(json.dumps(a[0]) + '\\n')\n")
 payload = json.dumps({"session_id": "tot-par", "model": OPUS, "prompt_cache": pc()})
 procs = [subprocess.Popen([sys.executable, "-B", "-c", PATCH, str(ROOT), "{}", stub, "statusline"], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=SPAWN_ENV, cwd=WORK)
@@ -803,6 +833,10 @@ for p_ in procs:
 codes = [p_.wait() for p_ in procs]
 spawns = len(spawn_log.read_text().splitlines()) if spawn_log.exists() else 0
 check("totals: four status lines at once start one scan", codes == [0] * 4 and spawns == 1, f"{codes} {spawns}")
+argv = json.loads(spawn_log.read_text().splitlines()[0]) if spawns else []
+token = TOTALS_LOCK.read_text() if TOTALS_LOCK.exists() else ""
+check("totals: the scan is handed the lock's token", len(token) >= 8 and argv[-2:] == ["--lock", token]
+      and oct(TOTALS_LOCK.stat().st_mode & 0o777) == oct(0o644), f"{argv} {token!r}")
 TOTALS_LOCK.unlink(missing_ok=True)
 refresh()
 
