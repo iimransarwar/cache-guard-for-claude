@@ -615,6 +615,99 @@ rc2, out2, _ = cost_sl("cost-bad", p1)
 check("statusline cost: a corrupt state never breaks the line and recovers", rc == 0 and rc2 == 0
       and "misses 0" in out and agrees(money(out2), ref1), out + err + out2)
 
+# ---------------- all-projects totals
+TOTALS_JSON = HOME / ".claude" / "cache-guard" / "totals.json"
+TOTALS_FILES = HOME / ".claude" / "cache-guard" / "totals-files.json"
+TOTALS_LOCK = HOME / ".claude" / "cache-guard" / "totals.lock"
+PROJ = HOME / ".claude" / "projects"
+
+
+def tot_session(folder, cwd, rows):
+    d = PROJ / folder
+    d.mkdir(parents=True, exist_ok=True)
+    head = line({"type": "user", "timestamp": iso(NOW - 900), "cwd": cwd,
+                 "message": {"role": "user", "content": "hi"}}) if cwd else b""
+    p = d / "s1.jsonl"
+    p.write_bytes(head + b"".join(line(r) for r in rows))
+    return p
+
+
+def warm_rows(tag, n, size):
+    """A session start then n-1 warm turns: each reads the whole prefix and writes 500 new tokens."""
+    return [resp(f"{tag}{k}", NOW - 800 + 20 * k, O, size if k == 0 else 500, 0 if k == 0 else size + 500 * (k - 1))
+            for k in range(n)]
+
+
+def refresh(pre="", *extra):
+    p = subprocess.run([sys.executable, "-B", "-c", PATCH, str(ROOT), "{}", pre, "totals-refresh", *extra],
+                       capture_output=True, text=True, env=ENV, cwd=WORK)
+    return p.returncode, p.stdout, p.stderr
+
+
+COUNT_READS = ("n = [0]\nf = cg.load_requests\n"
+               "def counted(*a, **k):\n    n[0] += 1\n    return f(*a, **k)\n"
+               "cg.load_requests = counted\nimport atexit\natexit.register(lambda: print('READS', n[0]))\n")
+
+
+def reads(out):
+    m = re.search(r"READS (\d+)", out)
+    return int(m.group(1)) if m else -1
+
+
+def totals_vs_full_read():
+    try:
+        t = json.loads(TOTALS_JSON.read_text())
+    except Exception as e:
+        return {}, False, str(e)
+    refs = [reference(p) for p in PROJ.glob("*/*.jsonl") if p.stat().st_mtime >= time.time() - 30 * 86400]
+    cost, saved = sum(r["cost"] for r in refs), sum(r["saved"] for r in refs)
+    ok = abs(t["cost"] - cost) < 1e-6 and abs(t["saved"] - saved) < 1e-6
+    return t, ok, f"totals {t.get('cost')}/{t.get('saved')} vs full read {cost}/{saved}"
+
+
+pa = tot_session("-tot-alpha", "/x/alpha", warm_rows("al", 30, 60000))
+pb = tot_session("-tot-beta", "/x/beta", warm_rows("be", 10, 30000))
+tot_session("-tot-nocwd", None, warm_rows("nc", 5, 20000))
+po = tot_session("-tot-old", "/x/old", warm_rows("ol", 5, 20000))
+os.utime(po, (NOW - 40 * 86400, NOW - 40 * 86400))
+
+rc, out, err = refresh()
+t, ok, why = totals_vs_full_read()
+check("totals: refresh matches a full read of every session", rc == 0 and ok, f"{out}{err}\n{why}")
+names = [x.get("name") for x in t.get("projects", [])]
+check("totals: projects named after the last folder of cwd, most saved first",
+      "alpha" in names and "beta" in names and names.index("alpha") < names.index("beta"), json.dumps(t)[:600])
+check("totals: a project with no cwd uses its folder name", "tot-nocwd" in names, json.dumps(names))
+check("totals: sessions older than totals_days are left out",
+      "-tot-old" not in [x.get("key") for x in t.get("projects", [])] and str(po) not in TOTALS_FILES.read_text()
+      if TOTALS_FILES.exists() else False, json.dumps(t)[:600])
+
+rc, out, err = refresh(COUNT_READS)
+check("totals: an unchanged second scan re-reads nothing", rc == 0 and reads(out) == 0, out + err)
+with open(pb, "ab") as f:
+    f.write(line(resp("be-extra", NOW - 10, O, 500, 35000)))
+rc, out, err = refresh(COUNT_READS)
+t, ok, why = totals_vs_full_read()
+check("totals: appending to one session re-reads only that file", rc == 0 and reads(out) == 1 and ok,
+      f"{out}{err}\n{why}")
+
+extra = line(resp("al-extra", NOW - 5, O, 500, 75000))
+before = t.get("cost")
+with open(pa, "ab") as f:
+    f.write(extra[:len(extra) // 2])
+rc, out, err = refresh()
+t, ok, why = totals_vs_full_read()
+check("totals: a half-written last line is skipped", rc == 0 and ok and t.get("cost") == before, f"{out}{err}\n{why}")
+with open(pa, "ab") as f:
+    f.write(extra[len(extra) // 2:])
+rc, out, err = refresh()
+t, ok, why = totals_vs_full_read()
+check("totals: and counted once it is complete", rc == 0 and ok and t.get("cost", 0) > before, f"{out}{err}\n{why}")
+
+TOTALS_LOCK.write_text("")
+rc, out, err = refresh("", "--release-lock")
+check("totals: --release-lock removes the lock", rc == 0 and not TOTALS_LOCK.exists(), out + err)
+
 # ---------------- trim hook
 big = "\n".join([f"line {i}" for i in range(3000)] + ["ERROR: something broke at foo.py:12"] +
                 [f"tail {i}" for i in range(100)])

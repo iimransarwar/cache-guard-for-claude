@@ -51,6 +51,9 @@ GUARD_DIR = CLAUDE_DIR / "cache-guard"
 STATE_DIR = GUARD_DIR / "state"
 LOG_DIR = GUARD_DIR / "logs"
 CONFIG_PATH = GUARD_DIR / "config.json"
+TOTALS_PATH = GUARD_DIR / "totals.json"              # all-projects figures the status line shows
+TOTALS_FILES_PATH = GUARD_DIR / "totals-files.json"  # per-transcript figures, so a scan re-reads only what changed
+TOTALS_LOCK = GUARD_DIR / "totals.lock"              # held while a background scan runs
 SETTINGS = CLAUDE_DIR / "settings.json"
 STYLE_DIR = CLAUDE_DIR / "output-styles"
 SCRIPT_NAME = "cache_guard.py"
@@ -69,6 +72,9 @@ DEFAULT_CONFIG = {
     "pricing": {},               # override or add list prices: {"model-id-prefix": [in, 5m, 1h, read, out]}
     "statusline_cost": True,     # show session cost, avoidable cost and cache savings on the status line
     "avoidable_warn_pct": 15,    # colour the avoidable figure from this share of the session's cost
+    "statusline_totals": True,   # show the all-projects row on the status line
+    "totals_days": 30,           # window for the all-projects row, as report --all --days
+    "totals_refresh_minutes": 10,  # how old the all-projects figures may get before a background scan
     "cause_tip_seconds": 600,
     "trim": {
         "max_chars": 12000,      # only trim output longer than this
@@ -1532,6 +1538,107 @@ def cost_block(cfg, state):
         return ""
 
 
+# ------------------------------------------------------------------ all-projects totals
+def write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, path)
+
+
+def transcript_cwd(path):
+    """The folder a session ran in: the first string "cwd" in the transcript's first 500 lines, or None."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for i, ln in enumerate(f):
+                if i >= 500:
+                    break
+                if '"cwd"' not in ln:
+                    continue
+                try:
+                    cwd = json.loads(ln).get("cwd")
+                except Exception:
+                    continue
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except Exception:
+        pass
+    return None
+
+
+def file_figures(path, sidechain, table):
+    """(cost, saved) of one transcript at list price, as report counts them; unpriced requests add nothing."""
+    cost = saved = 0.0
+    for r in load_requests(path, sidechain=sidechain):
+        c = req_cost(r, table)
+        if c is not None:
+            cost += sum(c.values())
+        x = cache_saving(r, table)
+        if x is not None:
+            saved += x
+    return cost, saved
+
+
+def scan_totals(cfg, now):
+    """Cost and cache savings of every session report --all would cover, grouped by project folder. Figures per
+    transcript are kept in TOTALS_FILES_PATH, so a file whose size and mtime are unchanged is not read again."""
+    days = float(cfg.get("totals_days", 30))
+    cutoff = now - days * 86400
+    table = price_table(cfg)
+    prices = digest(json.dumps([VERSION, table, sorted(LARGE_PROMPT.items())]).encode(), 16)
+    cache = read_json(TOTALS_FILES_PATH) if TOTALS_FILES_PATH.exists() else None
+    old = cache.get("files") if isinstance(cache, dict) and cache.get("prices") == prices else None
+    old = old if isinstance(old, dict) else {}
+    files, projects = {}, {}
+
+    def figures(path, sidechain):
+        st = path.stat()
+        e = old.get(str(path))
+        if not (isinstance(e, dict) and e.get("size") == st.st_size and e.get("mtime_ns") == st.st_mtime_ns):
+            cost, saved = file_figures(path, sidechain, table)
+            e = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "cost": cost, "saved": saved,
+                 "cwd": None if sidechain else transcript_cwd(path)}
+        files[str(path)] = e
+        return e
+
+    root = CLAUDE_DIR / "projects"
+    for path in sorted(root.glob("*/*.jsonl")) if root.is_dir() else []:
+        try:
+            mtime = path.stat().st_mtime
+            if mtime < cutoff:
+                continue
+            runs = [figures(path, False)] + [figures(f, True) for f in subagent_files(path)]
+        except OSError:  # deleted or unreadable while scanning
+            continue
+        key = path.parent.name
+        pr = projects.setdefault(key, {"key": key, "cost": 0.0, "saved": 0.0, "cwd": None, "cwd_mtime": -1.0})
+        pr["cost"] += sum(float(e["cost"]) for e in runs)
+        pr["saved"] += sum(float(e["saved"]) for e in runs)
+        if runs[0].get("cwd") and mtime > pr["cwd_mtime"]:  # the newest session's folder names the project
+            pr["cwd"], pr["cwd_mtime"] = runs[0]["cwd"], mtime
+
+    out = []
+    for pr in projects.values():
+        name = re.split(r"[\\/]", pr["cwd"].rstrip("/\\"))[-1] if pr["cwd"] else ""
+        out.append({"key": pr["key"], "name": name or pr["key"].lstrip("-") or pr["key"],
+                    "cost": pr["cost"], "saved": pr["saved"]})
+    out.sort(key=lambda x: (-x["saved"], x["name"]))
+    write_json_atomic(TOTALS_FILES_PATH, {"prices": prices, "files": files})
+    return {"computed_at": now, "days": days, "cost": sum(x["cost"] for x in out),
+            "saved": sum(x["saved"] for x in out), "projects": out}
+
+
+def cmd_totals_refresh(args):
+    try:
+        write_json_atomic(TOTALS_PATH, scan_totals(load_config(), time.time()))
+    finally:
+        if "--release-lock" in args:
+            try:
+                TOTALS_LOCK.unlink()
+            except Exception:
+                pass
+
+
 # ------------------------------------------------------------------ install
 def cmd_install(flags):
     want_all = "--all" in flags
@@ -1664,6 +1771,7 @@ def main():
         "report": lambda: cmd_report(sys.argv[2:]),
         "install": lambda: cmd_install(sys.argv[2:]),
         "uninstall": cmd_uninstall,
+        "totals-refresh": lambda: cmd_totals_refresh(sys.argv[2:]),
         "hook-model-switch": hook_model_switch,
         "hook-compact": hook_compact,
         "hook-prompt": hook_prompt,
