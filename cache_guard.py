@@ -44,7 +44,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 GUARD_DIR = CLAUDE_DIR / "cache-guard"
@@ -867,6 +867,65 @@ def read_json(path):
         return None
 
 
+IMPORT_RE = re.compile(r"(?<![\w`/])@((?:~|\.{1,2})?/?[\w.\-/]+\.[A-Za-z0-9]+)")
+SECRET_PATTERNS = [  # first match per line wins; values are never printed
+    ("an Anthropic API key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
+    ("an API key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}")),
+    ("an AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("a GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}")),
+    ("a Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("a password", re.compile(r"(?i)\b(?:password|passwd|pwd)\b\s*[:=]\s*['\"]?[^\s'\"]{8,}")),
+    ("a secret or token", re.compile(r"(?i)\b(?:secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\b"
+                                     r"\s*[:=]\s*['\"]?[^\s'\"]{12,}")),
+]
+
+
+def always_loaded(cwd):
+    """({kind: tokens}, [(path, text)]) for what Claude Code loads every session in `cwd`: CLAUDE.md files here and
+    above, their @imports (5 deep, outside code), this folder's auto-memory MEMORY.md, and rules with no paths: scope."""
+    sizes, files, seen = {"CLAUDE.md": 0, "@imports": 0, "auto memory": 0, "rules": 0}, [], set()
+
+    def add(kind, path, depth=0):
+        try:
+            path = path.expanduser().resolve()
+            if path in seen or not path.is_file() or path.stat().st_size > 2_000_000:
+                return
+            seen.add(path)
+            text = path.read_text(errors="ignore")
+        except Exception:
+            return
+        if kind == "rules" and re.match(r"---\s*\n(?:.*\n)*?paths\s*:", text):
+            return  # scoped to matching files: loaded only when Claude touches them
+        sizes[kind] += len(text) // 4
+        files.append((path, text))
+        if depth < 5 and kind in ("CLAUDE.md", "@imports"):
+            prose = re.sub(r"`[^`\n]*`", "", re.sub(r"```.*?```", "", text, flags=re.S))
+            for ref in IMPORT_RE.findall(prose):
+                add("@imports", Path(ref) if ref.startswith(("~", "/")) else path.parent / ref, depth + 1)
+
+    for d in [cwd, *cwd.parents]:
+        for name in ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"):
+            add("CLAUDE.md", d / name)
+    add("CLAUDE.md", CLAUDE_DIR / "CLAUDE.md")
+    add("auto memory", project_dir_for(cwd) / "memory" / "MEMORY.md")
+    for d in (cwd / ".claude" / "rules", CLAUDE_DIR / "rules"):
+        try:
+            for f in sorted(d.rglob("*.md")) if d.is_dir() else []:
+                add("rules", f)
+        except Exception:
+            pass
+    return sizes, files
+
+
+def secret_lines(path, text):
+    for n, ln in enumerate(text.splitlines(), 1):
+        for what, rx in SECRET_PATTERNS:
+            if rx.search(ln):
+                yield n, what
+                break
+
+
 def cmd_doctor():
     cwd = Path.cwd()
     files = [SETTINGS, cwd / ".claude" / "settings.json", cwd / ".claude" / "settings.local.json"]
@@ -892,7 +951,8 @@ def cmd_doctor():
     env = dict(merged_env)
     for k, v in os.environ.items():
         if k.startswith(("DISABLE_PROMPT", "FORCE_PROMPT", "ENABLE_PROMPT", "CLAUDE_CODE_", "ANTHROPIC_",
-                         "ENABLE_TOOL", "BASH_MAX", "MAX_MCP", "DISABLE_AUTO")):
+                         "ENABLE_TOOL", "BASH_MAX", "MAX_MCP", "DISABLE_AUTO", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS",
+                         "HTTPS_PROXY", "https_proxy")):
             env.setdefault(k, v)
 
     warns, notes, oks = [], [], []
@@ -912,7 +972,19 @@ def cmd_doctor():
     if env.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS") not in (None, "", "0", "false"):
         notes.append("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is set: effort changes break the cache, "
                      "and a mid-conversation context block is sent uncached.")
-    if env.get("ANTHROPIC_BASE_URL") and "api.anthropic.com" not in env["ANTHROPIC_BASE_URL"]:
+    base = env.get("ANTHROPIC_BASE_URL") or ""
+    node_opts = env.get("NODE_OPTIONS") or ""
+    proxy = env.get("HTTPS_PROXY") or env.get("https_proxy")
+    if re.search(r"(--import|--require|--loader|--experimental-loader)\b|(^|\s)-r\s", node_opts):
+        warns.append(f"NODE_OPTIONS preloads code into Claude Code ({node_opts[:60]}). Request rewriters loaded this way "
+                     "can change cache TTLs and markers, so what reaches Anthropic may not be what cache-guard reports.")
+    if proxy and env.get("NODE_EXTRA_CA_CERTS"):
+        warns.append(f"HTTPS_PROXY={proxy} with NODE_EXTRA_CA_CERTS: Claude Code's traffic goes through a proxy that holds "
+                     "its own certificate. It can read and rewrite every request, your conversation included.")
+    if re.search(r"//(localhost|127\.|\[::1\]|0\.0\.0\.0)", base):
+        warns.append(f"ANTHROPIC_BASE_URL={base} points at a local proxy. If it rewrites requests (TTLs, cache markers, "
+                     "system prompt), cache-guard's figures describe what Claude Code sent, not what Anthropic billed.")
+    elif base and "api.anthropic.com" not in base:
         notes.append(f"ANTHROPIC_BASE_URL={env['ANTHROPIC_BASE_URL']}: make sure the gateway forwards "
                      "cache_control markers and the anthropic-beta header, or caching silently stops.")
 
@@ -954,6 +1026,28 @@ def cmd_doctor():
                 notes.append(msg + ". Consider trimming or moving parts into skills.")
             else:
                 oks.append(msg + ".")
+    sizes, loaded = always_loaded(cwd)
+    total = sum(sizes.values())
+    if total:
+        msg = (f"Always loaded every session: ~{fmt_tokens(total)} tokens ("
+               + ", ".join(f"{k} ~{fmt_tokens(v)}" for k, v in sizes.items() if v) + ")")
+        if total > 15000:
+            warns.append(msg + ". Every turn re-reads it; move rarely used parts into skills or path-scoped rules.")
+        elif total > 6000:
+            notes.append(msg + ". Consider moving rarely used parts into skills or path-scoped rules.")
+        else:
+            oks.append(msg + ".")
+    mem_dir = project_dir_for(cwd) / "memory"
+    scanned = {p for p, _ in loaded}
+    extra = []
+    try:
+        extra = [(f, f.read_text(errors="ignore")) for f in sorted(mem_dir.glob("*.md")) if f.resolve() not in scanned]
+    except Exception:
+        pass
+    for path, text in loaded + extra:
+        for n, what in secret_lines(path, text):
+            warns.append(f"{path}:{n} looks like {what}. This file is sent to the model, so the value is too: "
+                         "keep it in an environment variable or your keychain instead.")
     mcp_count = 0
     for p in (HOME / ".claude.json", cwd / ".mcp.json"):
         j = read_json(p) if p.exists() else None

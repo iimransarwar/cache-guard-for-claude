@@ -16,7 +16,9 @@ SCRIPT = ROOT / "cache_guard.py"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 HOME = Path(tempfile.mkdtemp(prefix="cg-home-"))
 WORK = Path(tempfile.mkdtemp(prefix="cg-work-"))
-ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("BASH_MAX", "MAX_MCP"))}, "HOME": str(HOME),
+ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("BASH_MAX", "MAX_MCP", "NODE_OPTIONS", "NODE_EXTRA_CA",
+                                                                    "HTTPS_PROXY", "https_proxy", "ANTHROPIC_BASE_URL"))},
+       "HOME": str(HOME),
        "CACHE_GUARD_NO_SPAWN": "1"}  # status lines never start a background scan, except where a test turns it back on
 SPAWN_ENV = {k: v for k, v in ENV.items() if k != "CACHE_GUARD_NO_SPAWN"}
 NOW = int(time.time())
@@ -1032,6 +1034,35 @@ rc, out, err = run(["doctor"])
 check("doctor: runs", rc == 0, out + err)
 check("doctor: flags opusplan, forced 5m, injecting hook, big CLAUDE.md",
       all(x in out for x in ("opusplan", "FORCE_PROMPT_CACHING_5M", "returns additionalContext", "CLAUDE.md is ~8k")), out)
+
+W2 = Path(tempfile.mkdtemp(prefix="cg-work2-")).resolve()
+(W2 / "CLAUDE.md").write_text("Read @docs/guide.md for more. Mail me at me@example.com, see `@not/this.md`.\n"
+                              "password = hunter2hunter2\n" + "y" * 8000)
+(W2 / "docs").mkdir()
+(W2 / "docs" / "guide.md").write_text("z" * 20000 + "\nsee @nested.md\n")
+(W2 / "docs" / "nested.md").write_text("n" * 4000)
+(W2 / ".claude" / "rules").mkdir(parents=True)
+(W2 / ".claude" / "rules" / "always.md").write_text("r" * 30000)
+(W2 / ".claude" / "rules" / "scoped.md").write_text("---\npaths: src/**\n---\n" + "s" * 40000)
+mem = HOME / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(W2)) / "memory"
+mem.mkdir(parents=True)
+fake_key = "sk-ant-api03-" + "A1b2" * 10
+(mem / "MEMORY.md").write_text("m" * 8000 + "\n- notes\nAPI key: " + fake_key + "\n")
+env_x = {**ENV, "NODE_OPTIONS": "--import /opt/rewriter/preload.mjs", "HTTPS_PROXY": "http://127.0.0.1:9801",
+         "NODE_EXTRA_CA_CERTS": "/opt/rewriter/ca.pem", "ANTHROPIC_BASE_URL": "http://localhost:9801"}
+rc, out, err = run(["doctor"], cwd=W2, env=env_x)
+check("doctor: adds up everything loaded every session", rc == 0
+      and re.search(r"Always loaded every session: ~1[5-9]k tokens \(CLAUDE\.md ~2k, @imports ~6k, auto memory ~2k, "
+                    r"rules ~8k\)", out) is not None, out + err)
+check("doctor: flags secrets by file and line without printing them",
+      f"{mem / 'MEMORY.md'}:3 looks like an Anthropic API key" in out and f"{W2 / 'CLAUDE.md'}:2 looks like a password"
+      in out and fake_key not in out and "hunter2" not in out, out)
+check("doctor: flags request interceptors", all(x in out for x in (
+    "NODE_OPTIONS preloads code into Claude Code", "proxy that holds its own certificate",
+    "ANTHROPIC_BASE_URL=http://localhost:9801 points at a local proxy")), out)
+rc, out, err = run(["doctor"], cwd=WORK)
+check("doctor: a clean environment has no interceptor or secret warnings", rc == 0 and "preloads code" not in out
+      and "looks like" not in out and "local proxy" not in out, out)
 
 rc, out, err = run(["uninstall"])
 s = json.loads(settings.read_text())
