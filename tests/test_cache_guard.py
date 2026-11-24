@@ -16,14 +16,16 @@ SCRIPT = ROOT / "cache_guard.py"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 HOME = Path(tempfile.mkdtemp(prefix="cg-home-"))
 WORK = Path(tempfile.mkdtemp(prefix="cg-work-"))
-ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("BASH_MAX", "MAX_MCP"))}, "HOME": str(HOME)}
+ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("BASH_MAX", "MAX_MCP"))}, "HOME": str(HOME),
+       "CACHE_GUARD_NO_SPAWN": "1"}  # status lines never start a background scan, except where a test turns it back on
+SPAWN_ENV = {k: v for k, v in ENV.items() if k != "CACHE_GUARD_NO_SPAWN"}
 NOW = int(time.time())
 failures = 0
 
 
-def run(args, payload=None, cwd=WORK, raw=False):
+def run(args, payload=None, cwd=WORK, raw=False, env=None):
     p = subprocess.run([sys.executable, str(SCRIPT), *args], input=json.dumps(payload) if payload is not None else "",
-                       capture_output=True, text=True, env=ENV, cwd=cwd)
+                       capture_output=True, text=True, env=env or ENV, cwd=cwd)
     return p.returncode, (p.stdout if raw else ANSI.sub("", p.stdout)), ANSI.sub("", p.stderr)
 
 
@@ -42,10 +44,10 @@ def pc(**kw):
     return base
 
 
-def sl(sid, raw=False, **extra):
+def sl(sid, raw=False, env=None, **extra):
     d = {"session_id": sid, "model": {"display_name": "Opus 5.5"}}
     d.update(extra)
-    return run(["statusline"], d, raw=raw)
+    return run(["statusline"], d, raw=raw, env=env)
 
 
 # ---------------- status line
@@ -596,18 +598,19 @@ tips = json.loads(subprocess.run([sys.executable, "-B", "-c", "import sys, json;
 check("statusline cost: a tip explains cache cut", any("cache cut" in t and "5%" in t for t in tips), json.dumps(tips))
 p7 = write_session("cost-7", b"".join(line(resp(f"u{k}", NOW - 3000 + 30 * k, MYST, 1000, 30000 * k)) for k in range(4)), {})
 rc, out, _ = cost_sl("cost-7", p7)
-check("statusline cost: nothing priced leaves the block out", rc == 0 and "cost" not in out and "misses 0" in out, out)
+check("statusline cost: nothing priced leaves the block out", rc == 0 and "cost" not in out.splitlines()[0]
+      and "misses 0" in out, out)
 
 cfg_path.write_text(json.dumps({"statusline_cost": False}))
 rc, out, _ = cost_sl("cost-1", p1)
 st = json.loads((STATE / "cost-1.json").read_text())
-check("statusline cost: statusline_cost=false turns it off", "cost $" not in out and "misses 0" in out
+check("statusline cost: statusline_cost=false turns it off", "cost $" not in out.splitlines()[0] and "misses 0" in out
       and "costs" not in st, out)
 cfg_path.unlink()
 
 rc, out, err = cost_sl("cost-err", p1, pre="cg.session_costs = lambda *a, **k: 1 / 0")
 check("statusline cost: an error prints the line without the block", rc == 0 and "misses 0" in out
-      and "cost" not in out and "tip:" in out and not err, out + err)
+      and "cost" not in out.splitlines()[0] and "tip:" in out and not err, out + err)
 STATE.joinpath("cost-bad.json").write_text(json.dumps({"transcript_path": str(p1), "costs": {
     "path": str(p1), "prices": None, "main": "junk", "subs": [1], "shown": {"cost": "x"}}}))
 rc, out, err = cost_sl("cost-bad", p1)
@@ -708,6 +711,101 @@ TOTALS_LOCK.write_text("")
 rc, out, err = refresh("", "--release-lock")
 check("totals: --release-lock removes the lock", rc == 0 and not TOTALS_LOCK.exists(), out + err)
 
+# the all-projects row
+def fmt(x):
+    return f"${x:,.0f}" if x >= 100 else f"${x:.2f}"
+
+
+def wait_for(cond, seconds=15):
+    end = time.time() + seconds
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.2)
+    return cond()
+
+
+tot_session("-tot-long", "/x/" + "a" * 40, [resp("lo0", NOW - 700, O, 1000, 0), resp("lo1", NOW - 680, O, 500, 300_000_000)])
+refresh()
+t = json.loads(TOTALS_JSON.read_text())
+rc, out, err = sl("tot-1", prompt_cache=pc())
+lines = out.splitlines()
+row = lines[1] if len(lines) == 3 else ""
+check("totals: row sits between the cache line and the tip", rc == 0 and len(lines) == 3 and lines[2].startswith("tip:")
+      and re.fullmatch(r"30d all projects: cache cut \$[\d,.]+ → \$[\d,.]+ \(-\d+%\) \| most saved: .+", row) is not None,
+      out + err)
+check("totals: row figures are the scan's", f"cache cut {fmt(t['cost'] + t['saved'])} → {fmt(t['cost'])} " in row,
+      f"{row}\n{t['cost']} {t['saved']}")
+top = row.split("most saved: ")[-1]
+want = [x["name"] for x in sorted(t["projects"], key=lambda x: -x["saved"]) if x["saved"] > 0][:3]
+check("totals: top 3 only, most saved first, compact amounts", top.count(" · ") == 2 and want[:2] == ["a" * 40, "alpha"]
+      and re.fullmatch(r"a{23}… \$[\d.]+k · alpha \$[\d.]+ · " + re.escape(want[2]) + r" \$[\d.]+", top) is not None,
+      f"{row}\n{want}")
+check("totals: long project names are cut to 24 characters", "a" * 23 + "… " in row and "a" * 24 not in row, row)
+rc, out, err = sl("tot-2")
+check("totals: also shown while waiting for the first response", rc == 0 and len(out.splitlines()) == 3
+      and out.splitlines()[1].startswith("30d all projects: cache cut"), out + err)
+
+TOTALS_JSON.rename(TOTALS_JSON.with_name("totals.bak"))
+rc, out, err = sl("tot-3", prompt_cache=pc())
+check("totals: before the first scan it says counting…", rc == 0 and out.splitlines()[1:2] == ["30d all projects: counting…"],
+      out + err)
+TOTALS_JSON.write_text("{junk")
+rc, out, err = sl("tot-4", prompt_cache=pc())
+check("totals: a corrupt totals.json never breaks the line", rc == 0 and "misses 0" in out and "tip:" in out and not err,
+      out + err)
+TOTALS_JSON.with_name("totals.bak").replace(TOTALS_JSON)
+
+home2 = Path(tempfile.mkdtemp(prefix="cg-home2-"))
+env2 = {**ENV, "HOME": str(home2)}
+(home2 / ".claude" / "projects" / "-u").mkdir(parents=True)
+(home2 / ".claude" / "projects" / "-u" / "s1.jsonl").write_bytes(
+    b"".join(line(resp(f"u{k}", NOW - 600 + 20 * k, MYST, 1000, 30000 * k)) for k in range(4)))
+rc1, _, _ = run(["totals-refresh"], env=env2)
+rc, out, err = sl("tot-5", prompt_cache=pc(), env=env2)
+check("totals: nothing priced leaves the row out", rc1 == 0 and rc == 0
+      and (home2 / ".claude" / "cache-guard" / "totals.json").exists() and "all projects" not in out, out + err)
+
+cfg_path.write_text(json.dumps({"statusline_totals": False}))
+TOTALS_JSON.unlink(missing_ok=True)
+rc, out, err = sl("tot-6", prompt_cache=pc(), env=SPAWN_ENV)
+time.sleep(1.5)
+check("totals: statusline_totals=false leaves the row out and starts nothing", rc == 0 and "all projects" not in out
+      and not TOTALS_JSON.exists() and not TOTALS_LOCK.exists(), out + err)
+cfg_path.unlink()
+
+t0 = time.time()
+rc, out, err = sl("tot-7", prompt_cache=pc(), env=SPAWN_ENV)
+took = time.time() - t0
+check("totals: a stale result starts one background scan", rc == 0 and took < 3 and "counting…" in out
+      and wait_for(TOTALS_JSON.exists) and wait_for(lambda: not TOTALS_LOCK.exists()), f"{took:.1f}s\n{out}{err}")
+
+TOTALS_JSON.unlink(missing_ok=True)
+TOTALS_LOCK.write_text("")
+rc, out, err = sl("tot-8", prompt_cache=pc(), env=SPAWN_ENV)
+time.sleep(2)
+check("totals: a fresh lock stops a scan", rc == 0 and not TOTALS_JSON.exists() and TOTALS_LOCK.exists(), out + err)
+os.utime(TOTALS_LOCK, (NOW - 360, NOW - 360))
+rc, out, err = sl("tot-9", prompt_cache=pc(), env=SPAWN_ENV)
+check("totals: a lock older than 5 minutes is taken over", rc == 0 and wait_for(TOTALS_JSON.exists)
+      and wait_for(lambda: not TOTALS_LOCK.exists()), out + err)
+
+TOTALS_JSON.unlink(missing_ok=True)
+spawn_log = WORK / "spawns.log"
+stub = f"import pathlib\ncg.subprocess.Popen = lambda *a, **k: pathlib.Path({str(spawn_log)!r}).open('a').write('x\\n')\n"
+payload = json.dumps({"session_id": "tot-par", "model": OPUS, "prompt_cache": pc()})
+procs = [subprocess.Popen([sys.executable, "-B", "-c", PATCH, str(ROOT), "{}", stub, "statusline"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=SPAWN_ENV, cwd=WORK)
+         for _ in range(4)]
+for p_ in procs:
+    p_.stdin.write(payload)
+    p_.stdin.close()
+codes = [p_.wait() for p_ in procs]
+spawns = len(spawn_log.read_text().splitlines()) if spawn_log.exists() else 0
+check("totals: four status lines at once start one scan", codes == [0] * 4 and spawns == 1, f"{codes} {spawns}")
+TOTALS_LOCK.unlink(missing_ok=True)
+refresh()
+
 # ---------------- trim hook
 big = "\n".join([f"line {i}" for i in range(3000)] + ["ERROR: something broke at foo.py:12"] +
                 [f"tail {i}" for i in range(100)])
@@ -757,7 +855,9 @@ check("install: compact/session/trim hooks", "hook-compact" in json.dumps(h["Pre
       and "hook-trim" in json.dumps(h["PostToolUse"]), json.dumps(h))
 check("install: cold-message hook", "hook-prompt" in json.dumps(h["UserPromptSubmit"]), json.dumps(h))
 check("install: config gets the new defaults", json.loads(cfg_path.read_text()).get("cold_prompt") == "warn"
-      and json.loads(cfg_path.read_text()).get("statusline_cost") is True, cfg_path.read_text())
+      and json.loads(cfg_path.read_text()).get("statusline_cost") is True
+      and {k: json.loads(cfg_path.read_text()).get(k) for k in ("statusline_totals", "totals_days", "totals_refresh_minutes")}
+      == {"statusline_totals": True, "totals_days": 30, "totals_refresh_minutes": 10}, cfg_path.read_text())
 check("install: user hooks preserved", h["Stop"][0]["hooks"][0]["command"] == "echo done" and any("inject.sh" in json.dumps(g) for g in h["PostToolUse"]), json.dumps(h))
 check("install: style copied", (HOME / ".claude" / "output-styles" / "lean.md").exists())
 check("install: backup written", any(p.name.startswith("settings.json.bak-") for p in settings.parent.iterdir()))

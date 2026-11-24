@@ -30,10 +30,11 @@ Install backs up `~/.claude/settings.json` first, keeps your own hooks, and repl
 
 ## What you get
 
-**Status line** (two lines, refreshes every 30s)
+**Status line** (three lines, refreshes every 30s)
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 58% left (5h) · 82% left (week)
+30d all projects: cache cut $38,520 → $4,310 (-89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
 tip: Last miss: tool definitions changed. Leave MCP servers and plugins alone until a break.
 ```
 
@@ -43,6 +44,8 @@ The money figures are for the current session at API list prices. On a subscript
 - **avoidable**: the part of that cost spent re-writing cache that should have been read. That is every rebuild `report` lists under Cache misses (idle past the cache TTL, a model switch, a resume or restart, changed tools, or a prefix change with no cause in the transcript), at the price `report` shows for each. Session start and after-compaction writes are expected and not counted. Like the report, it covers the main conversation. It turns yellow at `avoidable_warn_pct` of the cost (default 15%) and is left out while it is $0.00.
 
 Requests on models without a price are left out of every figure, as in `report`. If nothing in the session can be priced, the block is left out. The status line keeps running totals in its state file and reads only what the transcripts gained since the last refresh. It spends at most half a second reading per refresh. If a refresh runs out of time (the first one on a very large session, for example), it shows the last figures it had, or none yet, and carries on at the next refresh. An error leaves the block out, never the line. Turn it off with `statusline_cost`.
+
+**All-projects line**: the same cache cut, for every session in every project over the last `totals_days` days (default 30), then the three projects caching saved the most in. The figures match `report --all --days 30` (its two cost rows added together). Projects are named after the folder the session ran in. Reading 30 days of transcripts can take several seconds, so the status line never does it itself: it shows the last saved figures, and when they are over `totals_refresh_minutes` old (default 10) it starts one scan in the background. A lock file makes sure several open sessions start only one scan between them. After the first scan, only transcripts that changed are read again. Until the first scan finishes the line says `counting…`. With nothing priced, the line is left out. Turn it off with `statusline_totals`.
 
 Usage limits show as percent left, named for whom they apply to. When a limit has both a 5-hour and a weekly window, each says which it is, as in `All models: 58% left (5h) · 82% left (week)`. A limit for a single model comes first, under that model's name, for example `Fable: 61% left`. Behind a Claude apps gateway, a spend limit shows as `Spend limit: 37% left`. Any other limit Claude Code passes in the same shape is shown too, named from its key (`seven_day_fable` would read as the weekly Fable limit). A limit turns yellow at `limit_warn_pct` used (default 80%) and red at 90% used. With no limit data, on an API key for example, this part is left out.
 
@@ -114,6 +117,9 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `cold_prompt_confirm_seconds` | 120 | With `block`, the window to send a stopped message again |
 | `pricing` | {} | Price overrides, per million tokens: `{"model-id-prefix": [input, 5m write, 1h write, cache read, output]}` |
 | `statusline_cost` | true | Show session cost, avoidable cost and cache savings on the status line |
+| `statusline_totals` | true | Show the all-projects line |
+| `totals_days` | 30 | Days of sessions the all-projects line covers |
+| `totals_refresh_minutes` | 10 | How old the all-projects figures may get before a background scan |
 | `avoidable_warn_pct` | 15 | Avoidable share of the session's cost (%) at which that figure turns yellow |
 | `trim.max_chars` | 12000 | Only trim output longer than this |
 | `trim.head_lines`, `trim.tail_lines` | 30, 60 | Lines kept at the start and end |

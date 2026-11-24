@@ -401,9 +401,14 @@ def cmd_statusline():
     if data.get("transcript_path"):
         state["transcript_path"] = data["transcript_path"]
 
+    totals = totals_line(cfg, now)
+    maybe_spawn_refresh(cfg, now)
+
     if not pc:
         save_state(sid, state)
         print(f"{model} {DIM}| cache: waiting for first response{RST}{limits_txt}")
+        if totals:
+            print(totals)
         print(f"{DIM}tip: {rotating}{RST}")
         return
 
@@ -453,6 +458,8 @@ def cmd_statusline():
         usd, _ = cold_cost(cfg, model_id, recache, ttl)
         line1 += f" | next msg re-reads ~{fmt_tokens(recache)}" + (f" (~{fmt_usd(usd)})" if usd else "")
     print(line1)
+    if totals:
+        print(totals)
 
     # tip line, most urgent first
     causes = ((pc.get("last_miss_cause") or {}).get("causes")) or []
@@ -1637,6 +1644,89 @@ def cmd_totals_refresh(args):
                 TOTALS_LOCK.unlink()
             except Exception:
                 pass
+
+
+TOTALS_LOCK_STALE_SECONDS = 300  # a lock this old belongs to a scan that died; take it over
+TOTALS_NAME_MAX = 24
+
+
+def totals_on(cfg):
+    on = cfg.get("statusline_totals", True)
+    return not (on is False or str(on).strip().lower() in ("false", "0", "off", "no", "none"))
+
+
+def read_totals():
+    t = read_json(TOTALS_PATH) if TOTALS_PATH.exists() else None
+    return t if isinstance(t, dict) else None
+
+
+def totals_fresh(t, cfg, now):
+    try:
+        return (float(t["days"]) == float(cfg.get("totals_days", 30))
+                and now - float(t["computed_at"]) <= float(cfg.get("totals_refresh_minutes", 10)) * 60)
+    except Exception:
+        return False
+
+
+def short_name(name):
+    name = str(name or "?")
+    return name if len(name) <= TOTALS_NAME_MAX else name[:TOTALS_NAME_MAX - 1] + "…"
+
+
+def totals_line(cfg, now):
+    """'30d all projects: cache cut $A → $B (-N%) | most saved: x $1.2k · y $340 · z $12.50' from the last scan,
+    'counting…' before the first one, or None when it is off, nothing is priced or anything goes wrong."""
+    try:
+        if not totals_on(cfg):
+            return None
+        t = read_totals()
+        if t is None:
+            return f"{DIM}{float(cfg.get('totals_days', 30)):g}d all projects:{RST} counting…"
+        cost, saved = float(t["cost"]), float(t["saved"])
+        if cost == 0 and saved == 0:
+            return None
+        text = f"{DIM}{float(t['days']):g}d all projects:{RST} {cut_text(cost, saved)}"
+        top = sorted((x for x in t.get("projects") or [] if float(x.get("saved", 0)) > 0),
+                     key=lambda x: -float(x["saved"]))[:3]
+        if top:
+            text += " | most saved: " + " · ".join(
+                f"{short_name(x.get('name'))} {fmt_compact_usd(float(x['saved']))}" for x in top)
+        return text
+    except Exception:
+        return None
+
+
+def maybe_spawn_refresh(cfg, now):
+    """Start one detached totals-refresh when the last scan is missing or stale. The lock, created with O_EXCL, lets
+    only one of several status lines start it; the scan removes it when done. Never raises, never waits."""
+    try:
+        if not totals_on(cfg) or os.environ.get("CACHE_GUARD_NO_SPAWN"):
+            return
+        t = read_totals()
+        if t is not None and totals_fresh(t, cfg, now):
+            return
+        GUARD_DIR.mkdir(parents=True, exist_ok=True)
+        for attempt in (0, 1):
+            try:
+                os.close(os.open(str(TOTALS_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                break
+            except FileExistsError:
+                if attempt or now - TOTALS_LOCK.stat().st_mtime <= TOTALS_LOCK_STALE_SECONDS:
+                    return
+                TOTALS_LOCK.unlink()
+        # no pipe is inherited, so Claude Code never waits on the child for the status line's output
+        kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            kw["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200))
+        else:
+            kw["start_new_session"] = True
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "totals-refresh", "--release-lock"], **kw)
+        except Exception:
+            TOTALS_LOCK.unlink()
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ install
