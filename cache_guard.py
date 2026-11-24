@@ -16,7 +16,8 @@ Commands
                         --notify   desktop alert when a warm cache is about to expire
                         --lean     make the bundled "Lean" output style your default
                         --all      --notify and --lean (never the trimmer: ask for that with --trim)
-                        --no-trim / --no-notify   turn those back off
+                        --keepwarm keep a long session's cache warm while you're away (wakes Claude briefly)
+                        --no-trim / --no-notify / --no-keepwarm   turn those back off
   uninstall           Remove cache-guard from settings.json.
 
 Hook entry points (wired by install; you never call these yourself)
@@ -27,6 +28,8 @@ Hook entry points (wired by install; you never call these yourself)
                       prompts are never touched.
   hook-session-start  SessionStart: warn when a resume re-sends a big, expired history.
   hook-trim           PostToolUse (Bash): trim huge output, keep errors, save the full log.
+  hook-keepwarm       Stop, in the background (opt-in): while you're away, wake Claude for a one-word reply just
+                      before the cache expires, as long as that costs less than a rebuild.
 
 Design rule: hooks only ever show messages to YOU (systemMessage / stderr).
 They never inject text into Claude's context, so they can't break the cache themselves.
@@ -65,6 +68,9 @@ DEFAULT_CONFIG = {
     "expiry_warn_minutes": 3,    # status-line warning threshold
     "context_warn_pct": 75,      # suggest /compact at a break above this
     "limit_warn_pct": 80,        # 5-hour / 7-day usage warning threshold
+    "keepwarm": False,           # keep the cache warm while you're away (install --keepwarm wires the hook)
+    "keepwarm_lead_minutes": 5,  # on a 1h cache, ping this long before it expires (a 5m cache: 1 minute)
+    "keepwarm_max_hours": 12,    # stop keeping a session warm after this long away
     "pace_forecast": True,       # say when the recent pace uses a limit up before it resets
     "pace_window_minutes": 30,   # how far back the pace is measured
     "resume_warn_tokens": 50000, # warn on resume when re-sending more than this, uncached
@@ -142,6 +148,7 @@ TIPS = [
     "Run `cache_guard.py doctor` to find settings that silently break your cache.",
     "Run `cache_guard.py report` after a session to see which moments rebuilt the cache.",
     "Hooks that inject text on every tool call can break the cache. doctor flags them.",
+    "Stepping away from a long session? install --keepwarm keeps its cache warm for less than one rebuild.",
     "cache cut $A → $B: $A is what re-sending your history every turn would cost at full price. "
     "The cache bills those repeats at about 5%.",
 ]
@@ -531,7 +538,11 @@ def cmd_statusline():
         cache_txt = f"{colour}warm{left}{RST}"
     else:
         cache_txt = f"{RED}{BOLD}COLD{RST}"
-    line1 = f"{model} | cache {pct} ({cache_txt}, ttl {ttl}){cost_txt} | misses {misses}{limits_txt}"
+    kw = load_keepwarm(sid)
+    kept = int(kw.get("keepwarm_pings") or 0) if (float(kw.get("keepwarm_fired_at") or 0)
+                                                   > float(kw.get("last_prompt_at") or 0)) else 0
+    kept_txt = f", kept warm ×{kept}" if kept else ""
+    line1 = f"{model} | cache {pct} ({cache_txt}, ttl {ttl}{kept_txt}){cost_txt} | misses {misses}{limits_txt}"
     if not warm and recache:
         usd, _ = cold_cost(cfg, model_id, recache, ttl)
         line1 += f" | next msg re-reads ~{fmt_tokens(recache)}" + (f" (~{fmt_usd(usd)})" if usd else "")
@@ -632,6 +643,109 @@ def hook_compact():
     sys.exit(2)
 
 
+TTL_SECONDS = {"1h": 3600.0, "5m": 300.0}
+KEEPWARM_POLL = 30.0          # seconds between checks while waiting
+KEEPWARM_ALIVE = 120          # the status line ran this recently: the session is still open
+KEEPWARM_OWN_TURN = 90        # a prompt this soon after a ping is the ping's own turn, not the user coming back
+KEEPWARM_PING_TOKENS = (200, 20)  # rough tokens a ping adds to the cache, and its reply
+KEEPWARM_MSG = ("cache-guard keep-warm ping (automatic: the user is away and this only keeps the prompt cache warm). "
+                "Reply with only: ok. Do not use tools and do not continue any task.")
+
+
+def keepwarm_path(session_id):
+    p = state_path(session_id)
+    return p.with_name(p.stem + ".keepwarm.json")
+
+
+def load_keepwarm(session_id):
+    j = read_json(keepwarm_path(session_id))
+    return j if isinstance(j, dict) else {}
+
+
+def save_keepwarm(session_id, data):
+    try:
+        write_json_atomic(keepwarm_path(session_id), data)
+    except Exception:
+        pass
+
+
+def keepwarm_on(cfg):
+    v = cfg.get("keepwarm", False)
+    return v is True or str(v).strip().lower() in ("true", "1", "on", "yes")
+
+
+def keepwarm_lead(ttl, cfg):
+    """Seconds before expiry to ping: keepwarm_lead_minutes on a 1h cache, 1 minute on a 5m one."""
+    secs = TTL_SECONDS.get(ttl, TTL_SECONDS["5m"])
+    try:
+        lead = float(cfg.get("keepwarm_lead_minutes", 5)) * 60 if ttl == "1h" else 60.0
+    except Exception:
+        lead = 300.0
+    return float(min(max(lead, 0.0), secs * 0.95))
+
+
+def keepwarm_allowance(cfg, model_id, tokens, ttl):
+    """How many pings together cost less than one rebuild of `tokens`; None when the model has no price."""
+    p = price_for(price_table(cfg), model_id, int(tokens))
+    if not p:
+        return None
+    write = p[2] if ttl == "1h" else p[1]
+    ping = int(tokens) * p[3] + KEEPWARM_PING_TOKENS[0] * write + KEEPWARM_PING_TOKENS[1] * p[4]
+    return int(int(tokens) * write // ping) if ping > 0 else None
+
+
+def hook_keepwarm():
+    """Stop hook run in the background (async + asyncRewake). While the user stays away, exit 2 shortly before the
+    cache expires so Claude Code wakes Claude with KEEPWARM_MSG; its one-word reply reads the cache and resets the TTL.
+    Stands down when a newer turn re-arms it, the user types, the session closes, the Mac slept past the expiry, the
+    history is too small to matter, the pings would cost more than one rebuild, or keepwarm_max_hours have passed."""
+    data = read_stdin_json()
+    cfg = load_config()
+    sid = data.get("session_id")
+    if not keepwarm_on(cfg) or not sid:
+        return
+    ttl = load_state(sid).get("ttl")
+    if ttl not in TTL_SECONDS:
+        return  # the status line hasn't seen this session's cache yet
+    armed, token = time.time(), os.urandom(6).hex()
+    kw = load_keepwarm(sid)
+    if float(kw.get("keepwarm_fired_at") or 0) <= float(kw.get("last_prompt_at") or 0):
+        kw.update(keepwarm_pings=0, keepwarm_since=armed)  # the user was here since the last ping: a new stretch
+    kw["keepwarm_armed"] = token
+    save_keepwarm(sid, kw)
+    expiry = armed + TTL_SECONDS[ttl]
+    target = expiry - keepwarm_lead(ttl, cfg)
+
+    def stood_down():
+        k = load_keepwarm(sid)
+        return k.get("keepwarm_armed") != token or float(k.get("last_prompt_at") or 0) > armed
+
+    while time.time() < target:  # wall clock, so a Mac that slept is noticed
+        time.sleep(max(0.0, min(KEEPWARM_POLL, target - time.time())))
+        if stood_down() or not keepwarm_on(load_config()):
+            return
+    now = time.time()
+    st, kw = load_state(sid), load_keepwarm(sid)
+    if stood_down() or now >= expiry or now - float(st.get("updated") or 0) > KEEPWARM_ALIVE:
+        return  # newer turn, user back, already cold, or the session is closed
+    tokens, model = st.get("recache_tokens_if_cold"), st.get("model_id")
+    if not tokens:
+        return
+    usd, _ = cold_cost(cfg, model, tokens, ttl)
+    if not over_cold_floor(cfg, tokens, usd):
+        return
+    pings = int(kw.get("keepwarm_pings") or 0)
+    allowed = keepwarm_allowance(cfg, model, tokens, ttl)
+    if allowed is not None and pings >= allowed:
+        return
+    if now - float(kw.get("keepwarm_since") or armed) > float(cfg.get("keepwarm_max_hours", 12)) * 3600:
+        return
+    kw.update(keepwarm_pings=pings + 1, keepwarm_fired_at=now)
+    save_keepwarm(sid, kw)
+    sys.stderr.write(KEEPWARM_MSG + "\n")
+    sys.exit(2)
+
+
 def over_cold_floor(cfg, tokens, usd):
     """Priced model with a dollar floor set: the re-read must cost at least that. Otherwise the token floor."""
     try:
@@ -722,13 +836,18 @@ def hook_prompt():
     source = data.get("source")
     if source not in (None, "user"):
         return  # loops, scheduled tasks, SDK and system turns are never touched
-    if str(data.get("prompt") or "").lstrip().startswith("/"):
-        return  # /clear and /compact are the way out, so never stand in front of a command
     sid = data.get("session_id")
     state = load_state(sid)
     if not state:
         return
-    before, now = json.dumps(state, sort_keys=True), time.time()
+    now = time.time()
+    kw = load_keepwarm(sid)
+    if kw and now - float(kw.get("keepwarm_fired_at") or 0) > KEEPWARM_OWN_TURN:
+        kw["last_prompt_at"] = now  # the user is here: any keep-warm timer stands down
+        save_keepwarm(sid, kw)
+    if str(data.get("prompt") or "").lstrip().startswith("/"):
+        return  # /clear and /compact are the way out, so never stand in front of a command
+    before = json.dumps(state, sort_keys=True)
     found = [r for r in (cold_prompt_check(cfg, state, source, now), budget_check(cfg, state, source, now)) if r[0]]
     if json.dumps(state, sort_keys=True) != before:
         save_state(sid, state)
@@ -1098,7 +1217,7 @@ def cmd_doctor():
         oks.append("cache-guard status line installed.")
     else:
         notes.append("cache-guard status line not installed (run install).")
-    installed = [ev for ev in ("PreModelSwitch", "PreCompact", "UserPromptSubmit", "SessionStart", "PostToolUse")
+    installed = [ev for ev in ("PreModelSwitch", "PreCompact", "UserPromptSubmit", "SessionStart", "PostToolUse", "Stop")
                  if any(SCRIPT_NAME in c for c, _ in hooks_by_event.get(ev, []))]
     (oks if installed else notes).append(f"cache-guard hooks: {', '.join(installed) or 'none (run install)'}.")
     oks.append(f"output style: {style or 'Default'}.")
@@ -2017,6 +2136,9 @@ def cmd_install(flags):
                    for h in g.get("hooks", []))
     # only --trim turns the trimmer on (never --all); re-running install keeps it if it was on, unless --no-trim
     trim = ("--trim" in flags or had_trim) and "--no-trim" not in flags
+    had_keepwarm = any("hook-keepwarm" in (h.get("command") or "")
+                       for g in ((existing.get("hooks") or {}).get("Stop") or []) for h in g.get("hooks", []))
+    keepwarm = ("--keepwarm" in flags or had_keepwarm) and "--no-keepwarm" not in flags
     want_notify = want_all or "--notify" in flags
     lean = want_all or "--lean" in flags
 
@@ -2039,6 +2161,10 @@ def cmd_install(flags):
         cfg["notify"] = True
     if "--no-notify" in flags:
         cfg["notify"] = False
+    if "--keepwarm" in flags:
+        cfg["keepwarm"] = True
+    if "--no-keepwarm" in flags:
+        cfg["keepwarm"] = False
     CONFIG_PATH.write_text(json.dumps({**{k: v for k, v in DEFAULT_CONFIG.items()}, **cfg}, indent=2) + "\n")
 
     py = "python3" if os.name != "nt" else "python"
@@ -2062,15 +2188,16 @@ def cmd_install(flags):
 
     hooks = settings.setdefault("hooks", {})
 
-    def set_hook(event, matcher, command):
+    def set_hook(event, matcher, command, **extra):
         groups = hooks.setdefault(event, [])
         for g in groups:
             for h in g.get("hooks", []):
                 if SCRIPT_NAME in (h.get("command") or ""):
                     h["command"] = command
+                    h.update(extra)
                     g["matcher"] = matcher
                     return
-        groups.append({"matcher": matcher, "hooks": [{"type": "command", "command": command}]})
+        groups.append({"matcher": matcher, "hooks": [{"type": "command", "command": command, **extra}]})
 
     def drop_hook(event):
         groups = [g for g in hooks.get(event, []) if not any(
@@ -2089,6 +2216,10 @@ def cmd_install(flags):
         set_hook("PostToolUse", "Bash", f"{cmd} hook-trim")
     else:
         drop_hook("PostToolUse")
+    if keepwarm:  # runs in the background and may wake Claude; the timeout only has to outlast a long absence
+        set_hook("Stop", "", f"{cmd} hook-keepwarm", **{"async": True, "asyncRewake": True, "timeout": 46800})
+    else:
+        drop_hook("Stop")
     if lean:
         settings["outputStyle"] = "Lean"
 
@@ -2097,6 +2228,7 @@ def cmd_install(flags):
     print("  ✓ status line (refreshes every 30s)")
     print("  ✓ hooks: model-switch guard, cold /compact guard, cold-message guard, resume warning")
     print(f"  {'✓' if trim else '·'} Bash output trimmer {'' if trim else '(off; add --trim)'}")
+    print(f"  {'✓' if keepwarm else '·'} keep-warm while you're away {'' if keepwarm else '(off; add --keepwarm)'}")
     print(f"  {'✓' if want_notify or cfg.get('notify') else '·'} expiry notifications "
           f"{'' if want_notify or cfg.get('notify') else '(off; add --notify)'}")
     print(f"  ✓ Lean output style saved to {STYLE_DIR / 'lean.md'}"
@@ -2145,6 +2277,7 @@ def main():
         "hook-prompt": hook_prompt,
         "hook-session-start": hook_session_start,
         "hook-trim": hook_trim,
+        "hook-keepwarm": hook_keepwarm,
         # v1 names, kept so an old settings.json keeps working until you re-run install
         "pre-model-switch": hook_model_switch,
         "pre-compact": hook_compact,

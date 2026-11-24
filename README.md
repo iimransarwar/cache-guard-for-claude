@@ -4,9 +4,9 @@
 
 Every turn, Claude Code re-sends your whole conversation. Prompt caching bills those repeats at about 5% of the normal price, until the cache goes cold, you switch model, or a setting quietly breaks it. Then you pay full price again, and nothing tells you.
 
-cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
+cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, can keep a long session warm while you're away, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 175](https://img.shields.io/badge/tests-175%20checks-2ea44f)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 192](https://img.shields.io/badge/tests-192%20checks-2ea44f)
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 42% left (5h, out in ~40m) · 82% left (week)
@@ -22,6 +22,7 @@ tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before 
 - **Every project at a glance.** A second line prices the last 30 days across every project at API rates, shows what it would have cost without the cache, and names the three projects where caching saved the most. It's refreshed in the background, so the status line never slows down.
 - **Know before you hit the wall.** A pace forecast measures how fast your 5-hour limit is rising right now and says `out in ~40m` when you'd run out before the reset. Idle hours never skew it, and it stays silent when you're fine.
 - **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache says how much it would re-read and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task.
+- **Come back to a warm cache.** Opt in with `--keepwarm` and, while you're away, cache-guard wakes Claude for a one-word reply just before the cache expires. On a 1-hour cache that's about one ping an hour, a few cents each against dollars for a rebuild. It stops on its own once the pings would cost more than one rebuild, after 12 hours, or as soon as you type.
 - **A budget, if you want one.** Set `session_budget_usd` and you're told when a session, subagents included, passes it, and again at each multiple. Or have the message stopped once.
 - **A doctor for your setup.** It finds settings that silently break caching, adds up the CLAUDE.md files, imports, memory and rules loaded into every session, flags API keys and passwords sitting in them, and spots proxies that can rewrite your requests.
 - **Reports that explain the bill.** `report` lists every real cache miss with its likely cause and cost. `report --all` splits 30 days of spend by cause and subagents, and tells you whether a 5-minute or 1-hour subagent cache would have been cheaper on your own history.
@@ -33,21 +34,22 @@ There are other ways to attack the same problem. Each one gives up something cac
 | | **cache-guard** | Request-rewriting proxies | Keep-warm pingers | Usage bars and dashboards |
 | - | - | - | - | - |
 | Sits between Claude Code and Anthropic | **No** | Yes, every request | No | No |
-| Sends requests that use your quota | **Never** | No | Yes, every ping | Some poll usage APIs |
+| Sends requests that use your quota | **Only opt-in keep-warm, capped at the cost of one rebuild** | No | Yes, every ping | Some poll usage APIs |
 | Touches your Claude login token | **Never** | Every request passes through it | No | Some read it from your keychain |
-| Can change what Claude sees | **Only what you opt into** (Bash trimmer, Lean style) | Yes | Some add turns | No |
+| Can change what Claude sees | **Only what you opt into** (Bash trimmer, Lean style, keep-warm pings) | Yes | Some add turns | No |
 | Warns before cache-breaking moves | **Yes: model switch, cold `/compact`, cold message, resume** | No | Some, before a cold message | No |
 | Explains misses and their cost | **Yes, per miss and per cause** | Partly | No | Partly |
+| Keeps the cache warm while you're away | **Opt-in, only while it pays** | No | Yes, often by default | No |
 | Forecasts running out of quota | **Yes, from the recent pace** | No | No | Some, from window averages |
 | Install footprint | **One stdlib Python file** | Service, certificates or env vars | Plugin or hook | Extension, daemon or installer |
 
 ## Safe by design
 
-- **No network.** cache-guard never makes a request. Everything comes from what Claude Code passes to the status line and the transcripts already on your disk.
+- **No network.** cache-guard itself never makes a request; even keep-warm only asks Claude Code to take a turn. Everything comes from what Claude Code passes to the status line and the transcripts already on your disk.
 - **No proxy, no token.** It never sits in front of your API traffic and never reads your login credentials.
-- **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, and the Lean output style changes how Claude writes its replies.
+- **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, the Lean output style changes how Claude writes its replies, and keep-warm wakes Claude for a one-word reply while you're away.
 - **Your settings, backed up.** Install backs up `settings.json`, keeps your own hooks, and uninstalls in one command.
-- **Readable.** One file, standard library only, with a 175-check test suite that runs against a throwaway home folder.
+- **Readable.** One file, standard library only, with a 192-check test suite that runs against a throwaway home folder.
 
 ## Install
 
@@ -71,15 +73,16 @@ python3 ~/.claude/cache-guard/cache_guard.py doctor
 git pull && python3 cache_guard.py install
 ```
 
-Install copies the script to `~/.claude/cache-guard/`, backs up `~/.claude/settings.json` first, keeps your own hooks, and replaces any existing status line (it stays in the backup). Re-running it is safe. It keeps the trimmer if it is already on; `--no-trim` removes it.
+Install copies the script to `~/.claude/cache-guard/`, backs up `~/.claude/settings.json` first, keeps your own hooks, and replaces any existing status line (it stays in the backup). Re-running it is safe. It keeps the trimmer and keep-warm if they are already on; `--no-trim` and `--no-keepwarm` remove them.
 
 | Flag | What it adds |
 | - | - |
 | `--trim` | Trims huge Bash output (test and build logs) before Claude reads it |
 | `--notify` | Desktop alert when a warm cache is about to expire |
+| `--keepwarm` | Keeps a long session's cache warm while you're away (see Keep-warm below) |
 | `--lean` | Makes the bundled Lean output style your default |
 | `--all` | `--notify` and `--lean`. It never turns on the trimmer: only `--trim` does |
-| `--no-trim`, `--no-notify` | Turn those back off |
+| `--no-trim`, `--no-notify`, `--no-keepwarm` | Turn those back off |
 
 ## Reference
 
@@ -116,7 +119,7 @@ The tip is the most urgent of these:
 4. A usage limit over 80% used: names the limit, says how much is left and when it resets, and suggests avoiding expensive actions until then.
 5. The cause of a miss in the last 10 minutes.
 6. Context above 75%: `/compact` at your next break.
-7. Otherwise, a rotating tip from 25 do's and don'ts.
+7. Otherwise, a rotating tip from 26 do's and don'ts.
 
 ### Guards (hooks)
 
@@ -127,6 +130,7 @@ The tip is the most urgent of these:
 | Cold message | When you type into a session whose cache has gone cold and whose history would cost at least `cold_prompt_warn_usd` ($0.50) to re-read, you get a warning. The floor is in dollars because 100k tokens costs very different amounts on Haiku and Opus; models without a price fall back to `cold_prompt_warn_tokens` (100k). The warning says how long the cache has been cold, how many tokens the message re-reads and what that costs at list price. For a new task, `/clear` first is far cheaper. The message itself goes through. Set `cold_prompt` to `block` to have it stopped once instead; you then send it again within 2 minutes to go ahead. Slash commands, loops, scheduled tasks and SDK prompts are never touched. |
 | Session budget (opt-in) | Set `session_budget_usd` and typed messages get a warning when the session's list-price cost (main conversation plus subagents) passes it, and again at 2×, 3× and so on. The status line adds `over $25 budget` in red. Set `session_budget_action` to `block` to have the message stopped once instead; send it again within 2 minutes to go ahead. If the cache is also cold, both warnings arrive as one message. It keeps working with `statusline_cost` off. |
 | Resume | Warns when a resume re-sends a big history after the cache has expired. |
+| Keep-warm (opt-in, `--keepwarm`) | A background Stop hook. After each of Claude's turns it waits quietly; if you haven't typed by shortly before the cache expires (`keepwarm_lead_minutes`, 5, before a 1h cache runs out; 1 minute before a 5m one), it wakes Claude with *reply with only: ok, no tools, no task*. That reply reads the cache, which resets its timer. It only pings when the rebuild would pass the cold-message floor, stops once the pings would add up to more than one rebuild (about 38 on a 1h Opus cache, about 1.7 hours' worth on a 5m one) or after `keepwarm_max_hours` (12), and never pings a cache that already went cold (a Mac that slept through) or a session you closed. Typing anything cancels it. The status line shows `kept warm ×3` while it's working. Your Mac has to stay awake: run `caffeinate -i` while you're away. |
 | Bash trimmer (opt-in) | Output over 12,000 chars keeps its first 30 lines, last 60 lines and every error or warning line. The full log is saved to `~/.claude/cache-guard/logs/` and Claude is told where. Add `# no-trim` to a command to skip trimming. |
 
 The hooks only show messages to you. They never inject text into Claude's context, so they can't break the cache themselves.
@@ -175,6 +179,9 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `expiry_warn_minutes` | 3 | When the status line warns about expiry |
 | `context_warn_pct` | 75 | When to suggest `/compact` |
 | `limit_warn_pct` | 80 | Share of a usage limit used (%) at which it turns yellow and the tip warns (red from 90%) |
+| `keepwarm` | false | Keep the cache warm while you're away (`install --keepwarm` sets it and wires the hook) |
+| `keepwarm_lead_minutes` | 5 | On a 1h cache, how long before it expires to ping (a 5m cache always uses 1 minute) |
+| `keepwarm_max_hours` | 12 | Stop keeping a session warm after this long away |
 | `pace_forecast` | true | Say when the recent pace uses a 5-hour limit up before it resets |
 | `pace_window_minutes` | 30 | How far back the pace is measured |
 | `resume_warn_tokens` | 50000 | Minimum history size for the resume warning |
@@ -207,7 +214,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ### Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 175 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 192 checks against a throwaway HOME
 ```
 
 ### Caveats
@@ -218,4 +225,5 @@ python3 tests/test_cache_guard.py   # 175 checks against a throwaway HOME
 - Causes in `report` are inferred from timing, model changes and markers in the transcript. `/usage` shows Claude Code's own diagnosis.
 - Prices are list prices from November 2026 and will go stale. Models without a price are counted in tokens and left out of cost. Fix either with `pricing` in the config.
 - The cold-message guard, the session budget and the pace forecast rely on the status line having run. With `cold_prompt` set to `block`, it also relies on Claude Code saying who sent the prompt. If your version doesn't say, the guard warns instead of stopping.
+- Keep-warm relies on Claude Code's background hooks (`async`, `asyncRewake`). Claude Code's docs don't say whether a woken turn is marked as automatic, so a typed message within 90 seconds of a ping isn't counted as you coming back. Claude is asked to reply with only `ok`, but it may occasionally say more. Each ping adds a few dozen tokens to the history.
 - The subagent cache-length verdict prices writes and pauses inside a subagent. It can't tell whether a longer cache would have warmed subagents that started cold.
