@@ -129,12 +129,12 @@ PACE = HOME / ".claude" / "cache-guard" / "pace.json"
 R5 = NOW + 3 * 3600
 
 
-def pace_sl(sid, used, samples, reset=R5, seed_reset=None, extra_limits=None, **kw):
+def pace_sl(sid, used, samples, reset=R5, seed_reset=None, extra_limits=None, pcache=None, **kw):
     PACE.parent.mkdir(parents=True, exist_ok=True)
     PACE.write_text(json.dumps({"All models|5h": {"reset": seed_reset or reset, "samples": samples}}))
     rl = {"five_hour": {"used_percentage": used, "resets_at": reset}}
     rl.update(extra_limits or {})
-    return sl(sid, prompt_cache=pc(), rate_limits=rl, **kw)
+    return sl(sid, prompt_cache=pcache or pc(), rate_limits=rl, **kw)
 
 
 rc, out, err = pace_sl("pace-1", 60, [[NOW - 1200, 40.0]])
@@ -187,6 +187,9 @@ check("pace: when the lockout outlasts the cache, the tip says compact or hand o
       "outlasts the cache" in tip and "/compact" in tip and "$1.44" in tip, out)
 rc, out, err = pace_sl("pace-14", 60, [[NOW - 1200, 40.0]], reset=NOW + 50 * 60, model=OPUS)
 check("pace: when the cache outlives the lockout, the tip says it will still be warm", "still be warm" in out, out)
+rc, out, err = pace_sl("pace-15", 60, [[NOW - 1200, 40.0]], pcache=pc(ttl=None, recache_tokens_if_cold=None))
+check("pace: with no TTL or history size known, the tip claims nothing about the cache", "still be warm" not in out
+      and "~?" not in out and "At this pace" in out, out)
 rc, out, err = sl("ctx-1", model=OPUS, prompt_cache=pc(recache_tokens_if_cold=337000))
 check("context meter: from 200k it shows the history and what re-reading it costs a turn",
       out.splitlines()[0].endswith("| misses 0 | ctx 337k · $0.07/turn"), out)
@@ -327,7 +330,7 @@ cfg_path.unlink()
 
 # ---------------- keep-warm
 KW_CONSTS = json.dumps({"TTL_SECONDS": {"1h": 4.0, "5m": 4.0}, "KEEPWARM_POLL": 0.05, "KEEPWARM_SETTLE": 0.2,
-                        "KEEPWARM_RESET_MARGIN": 0.1})
+                        "KEEPWARM_RESET_MARGIN": 0.1, "KEEPWARM_EXPIRY_GAP": 0.2})
 KW_STATE = HOME / ".claude" / "cache-guard" / "state"
 
 
@@ -488,13 +491,44 @@ check("keepwarm: a subscription on a 5-minute cache (extra-usage credits) isn't 
 kw_state("kw25", ttl="5m")
 rc, out, err = kw_wait(kw_start("kw25"))
 check("keepwarm: an API-key session on a 5-minute cache still is", rc == 2, f"{rc} {err}")
+kw_state("kw27", limits=[{"used": 100.0, "reset": time.time() + 3.95}])  # in the last 0.3 s before expiry
+rc, out, err = kw_wait(kw_start("kw27"))
+check("keepwarm: a reset too close to the expiry isn't bridged (the ping would land on a cold cache)", rc == 0
+      and not err.strip(), f"{rc} {err}")
+kw_state("kw28", limits=[{"used": 100.0, "reset": time.time() + 7200, "scope": "Fable"}])
+rc, out, err = kw_wait(kw_start("kw28"))
+check("keepwarm: a used-up limit for another model doesn't stop it", rc == 2, f"{rc} {err}")
+LIMITS = HOME / ".claude" / "cache-guard" / "limits.json"
+kw_state("kw29", limits=[{"used": 60.0, "reset": time.time() + 7200, "scope": "All models"}])
+LIMITS.write_text(json.dumps({"at": time.time(), "limits": [{"used": 100.0, "reset": time.time() + 7200,
+                                                              "scope": "All models"}]}))
+rc, out, err = kw_wait(kw_start("kw29"))
+check("keepwarm: the newest reading from any session wins, so it never pings into another session's lockout",
+      rc == 0 and not err.strip(), f"{rc} {err}")
+LIMITS.unlink()
+kw_state("kw30", limits=[{"used": 100.0, "reset": "2026-11-25T10:00:00Z", "scope": "All models"}])
+rc, out, err = kw_wait(kw_start("kw30"))
+check("keepwarm: a reset time it can't read counts as not reset", rc == 0 and not err.strip(), f"{rc} {err}")
+kw_state("kw31", ttl="5m", limits=[{"used": 10.0, "reset": time.time() + 7200, "scope": "Spend limit"}])
+rc, out, err = kw_wait(kw_start("kw31"))
+check("keepwarm: a gateway spend limit alone isn't a subscription, so a 5m cache is still kept warm", rc == 2,
+      f"{rc} {err}")
+kw_state("kw32", recache_tokens_if_cold=800000)
+t0 = time.time()
+rc, out, err = kw_wait(kw_start("kw32"))
+check("keepwarm: a history too big to keep warm is dropped at once, not after the wait", rc == 0
+      and time.time() - t0 < 1.5, f"{rc} {time.time() - t0:.2f}s {err}")
 kw_state("kw26", recache_tokens_if_cold=800000)
 rc, out, err = kw_wait(kw_start("kw26"))
 check("keepwarm: very large histories are left to idle compaction", rc == 0 and not err.strip(), f"{rc} {err}")
 sl("lim-1", prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 42, "resets_at": NOW + 3600}})
 lim = json.loads((KW_STATE / "lim-1.json").read_text()).get("limits")
-check("keepwarm: the status line saves each limit's use and reset time", isinstance(lim, list) and len(lim) == 1
-      and lim[0].get("used") == 42.0 and lim[0].get("reset") == NOW + 3600, json.dumps(lim))
+check("keepwarm: the status line saves each limit's use, reset time and scope", isinstance(lim, list) and len(lim) == 1
+      and lim[0].get("used") == 42.0 and lim[0].get("reset") == NOW + 3600 and lim[0].get("scope") == "All models",
+      json.dumps(lim))
+LJ = HOME / ".claude" / "cache-guard" / "limits.json"
+glob = json.loads(LJ.read_text()) if LJ.exists() else {}
+check("keepwarm: and the newest reading for every session in limits.json", glob.get("limits") == lim, json.dumps(glob))
 kw_state("kw12", keepwarm_pings=3, keepwarm_fired_at=time.time() - 5, last_prompt_at=t - 3600)
 rc, out, err = sl("kw12", prompt_cache=pc())
 check("keepwarm: the status line shows how many times it kept the cache warm", "kept warm ×3" in out.splitlines()[0], out)
@@ -648,8 +682,21 @@ burst = {"type": "user", "timestamp": iso(tb + 10), "message": {"role": "user", 
 (bdir / "blocks.jsonl").write_text("\n".join(json.dumps(r) for r in [
     usage_row(1, tb, "claude-opus-5-5", 40000, 0), burst, usage_row(2, tb + 30, "claude-opus-5-5", 41000, 0)]) + "\n")
 rc, out, err = run(["report", str(bdir / "blocks.jsonl")])
-check("report: a miss right after a turn that added 25 blocks is named as Claude Code's 20-block issue",
-      rc == 0 and "25 content blocks" in out, out + err)
+check("report: a miss right after a turn that returned 25 tool results is named as Claude Code's 20-block issue",
+      rc == 0 and "25 tool results" in out and "20-block" in out, out + err)
+def burst_of(n, **extra):
+    return dict({"type": "user", "timestamp": iso(tb + 10), "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": f"tu{k}", "content": "x"} for k in range(n)]}}, **extra)
+for name, mid in (("b12", [burst_of(12)]),
+                  ("blob", [dict(burst_of(25), type="api-request-blob"), burst_of(3)]),
+                  ("side", [dict(burst_of(25), isSidechain=True), burst_of(3)])):
+    (bdir / f"{name}.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        usage_row(1, tb, "claude-opus-5-5", 40000, 0), *mid, usage_row(2, tb + 30, "claude-opus-5-5", 41000, 0)]) + "\n")
+out12 = run(["report", str(bdir / "b12.jsonl")])[1]
+outblob = run(["report", str(bdir / "blob.jsonl")])[1]
+outside = run(["report", str(bdir / "side.jsonl")])[1]
+check("report: 12 parallel calls (24 blocks with their results) count, request logs and subagent lines don't",
+      "12 tool results" in out12 and "20-block" not in outblob and "20-block" not in outside, out12 + outblob + outside)
 cfg_path.write_text(json.dumps({"pricing": {"claude-opus-5-5": [40, 50, 80, 2, 200]}}))
 rc, out, err = run(["report", "sess-2"])
 check("report: prices can be overridden in config.json", "about $13.12" in out, out + err)
@@ -1240,6 +1287,17 @@ except ValueError:
 check("subagent guard: an expensive run tells you its cost and how to make subagents cheaper", rc == 0
       and "general-purpose" in msg and "$8." in msg and "CLAUDE_CODE_SUBAGENT_MODEL" in msg
       and "additionalContext" not in out, out + err)
+rc, out, err = run(["hook-subagent-stop"], dict(stop, agent_id="ax1", agent_type="general-purpose"))
+check("subagent guard: an agent continued later isn't warned again until it passes the next multiple",
+      rc == 0 and not out.strip(), out + err)
+(sdir / "elsewhere").mkdir(exist_ok=True)
+(sdir / "elsewhere" / "sonnet-run.jsonl").write_bytes(
+    line(resp("z1", NOW - 90, S, 3000000, 0, side=True)))
+rc, out, err = run(["hook-subagent-stop"], dict(stop, agent_id="az1", agent_type="general-purpose",
+                                               agent_transcript_path=str(sdir / "elsewhere" / "sonnet-run.jsonl")))
+msg = (json.loads(out) if out.strip().startswith("{") else {}).get("systemMessage", "")
+check("subagent guard: uses agent_transcript_path, and skips the model advice when the run was already cheap",
+      "$" in msg and "CLAUDE_CODE_SUBAGENT_MODEL" not in msg, out + err)
 rc, out, err = run(["hook-subagent-stop"], dict(stop, agent_id="ax2", agent_type="Explore"))
 check("subagent guard: a cheap run is silent", rc == 0 and not out.strip(), out + err)
 rc, out, err = run(["hook-subagent-stop"], dict(stop, agent_id="nope", agent_type="Explore"))
@@ -1354,6 +1412,11 @@ check("doctor: references to env vars are not secrets", f"{W2 / 'CLAUDE.local.md
 rc, out, err = run(["doctor"], cwd=WORK)
 check("doctor: says subagents run on the session's model when CLAUDE_CODE_SUBAGENT_MODEL isn't set",
       "CLAUDE_CODE_SUBAGENT_MODEL" in out and "Explore" in out, out)
+(W2 / ".claude" / "settings.json").write_text(json.dumps({"model": "claude-haiku-5-5"}))
+rc3, out3, _ = run(["doctor"], cwd=W2)
+(W2 / ".claude" / "settings.json").unlink()
+check("doctor: no subagent-model note when the session model is already cheap",
+      "CLAUDE_CODE_SUBAGENT_MODEL" not in out3, out3)
 rc2, out2, _ = run(["doctor"], cwd=WORK, env={**ENV, "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"})
 check("doctor: and is quiet about it once it is set", "CLAUDE_CODE_SUBAGENT_MODEL" not in out2, out2)
 check("doctor: a clean environment has no interceptor or secret warnings", rc == 0 and "preloads code" not in out

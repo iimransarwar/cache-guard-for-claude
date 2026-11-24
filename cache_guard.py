@@ -49,13 +49,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 GUARD_DIR = CLAUDE_DIR / "cache-guard"
 STATE_DIR = GUARD_DIR / "state"
 LOG_DIR = GUARD_DIR / "logs"
 CONFIG_PATH = GUARD_DIR / "config.json"
+LIMITS_PATH = GUARD_DIR / "limits.json"              # the newest usage-limit reading from any session
 PACE_PATH = GUARD_DIR / "pace.json"                  # recent usage-limit readings, for the pace forecast
 TOTALS_PATH = GUARD_DIR / "totals.json"              # all-projects figures the status line shows
 TOTALS_FILES_PATH = GUARD_DIR / "totals-files.json"  # per-transcript figures, so a scan re-reads only what changed
@@ -524,7 +525,12 @@ def cmd_statusline():
     if misses > int(state.get("misses_seen", 0)):
         state["miss_seen_at"] = now
     model_id = (data.get("model") or {}).get("id")
-    state["limits"] = [{"used": x["used"], "reset": x["reset"]} for x in limits]
+    state["limits"] = [{"used": x["used"], "reset": x["reset"], "scope": x["scope"]} for x in limits]
+    if limits:  # limits are per account: keep-warm in any session reads the newest reading
+        try:
+            write_json_atomic(LIMITS_PATH, {"at": now, "limits": state["limits"]})
+        except Exception:
+            pass
     state.update({"misses_seen": misses, "warm": warm, "expires_at": exp, "ttl": ttl,
                   "recache_tokens_if_cold": recache, "model": model, "model_id": model_id,
                   "caching_observed": bool(pc.get("caching_observed", True)), "updated": now})
@@ -594,10 +600,13 @@ def cmd_statusline():
         if ttl_secs and float(x["reset"]) - now - secs > ttl_secs:
             usd, _ = cold_cost(cfg, model_id, recache, ttl) if recache else (None, None)
             redo = f" (~{fmt_usd(usd)})" if usd else ""
+            size = f"~{fmt_tokens(recache)} " if recache else "the history "
             tip += (f"The lockout outlasts the cache: /compact or write a handoff before then, or rebuilding "
-                    f"~{fmt_tokens(recache)} after the reset costs the full price{redo}.")
-        else:
+                    f"{size}after the reset costs the full price{redo}.")
+        elif ttl_secs:
             tip += "The cache will still be warm when it resets. /effort low and fewer subagents stretch it."
+        else:
+            tip += "/effort low and fewer subagents stretch it."
     elif hot_limit:
         left = f"{hot_limit['left']:.0f}"
         when = f" (resets {fmt_clock(hot_limit['reset'])})" if hot_limit["reset"] else ""
@@ -683,6 +692,8 @@ KEEPWARM_SETTLE = 10.0        # transcript writes this soon after a turn ends be
 KEEPWARM_DEFAULT_ALLOWANCE = {"1h": 20, "5m": 12}  # models without a price: as if reads cost a tenth of input
 KEEPWARM_MARK = "cache-guard keep-warm ping"
 KEEPWARM_RESET_MARGIN = 30.0  # ping this long after a usage limit resets
+KEEPWARM_EXPIRY_GAP = 30.0    # ...but never closer than this to the cache's expiry
+MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 KEEPWARM_MSG = (KEEPWARM_MARK + " (automatic: the user is away and this only keeps the prompt cache warm). "
                 "Reply with only: ok. Do not use tools and do not continue any task.")
 
@@ -719,23 +730,63 @@ def keepwarm_lead(ttl, cfg):
     return float(min(max(lead, min(30.0, secs * 0.5)), secs * 0.95))  # a floor, or the ping lands on a cold cache
 
 
+def newest_limits(st):
+    """The session's own limit reading, or the account-wide one in LIMITS_PATH when that is newer."""
+    own, at = st.get("limits") or [], float(st.get("updated") or 0)
+    j = read_json(LIMITS_PATH) if LIMITS_PATH.exists() else None
+    try:
+        if isinstance(j, dict) and isinstance(j.get("limits"), list) and float(j.get("at") or 0) >= at:
+            return j["limits"]
+    except Exception:
+        pass
+    return own
+
+
+def limit_applies(x, model_id):
+    """All-model and spend limits apply to every session; a single model's limit only to that model."""
+    fam = str(x.get("scope") or "").split(" ")[0].lower()
+    return fam not in MODEL_FAMILIES or fam in str(model_id or "").lower()
+
+
 def keepwarm_lockout(st, cfg, now):
-    """None when no usage limit is at keepwarm_limit_pct; else when the last such limit resets (inf if unknown). The
-    status line's figures only update with the next request, so a limit whose reset time has passed counts as reset."""
+    """None when no applicable usage limit is at keepwarm_limit_pct; else when the last such limit resets (inf if
+    its reset time is missing or unreadable). The figures only update with the next request, so a limit whose reset
+    time has passed counts as reset."""
     try:
         pct = float(cfg.get("keepwarm_limit_pct", 95))
     except Exception:
         pct = 95.0
     resets = []
-    for x in st.get("limits") or []:
+    for x in newest_limits(st):
         try:
-            used, reset = float(x.get("used") or 0), x.get("reset")
-            if used < pct or (reset and now >= float(reset)):
+            if not isinstance(x, dict) or float(x.get("used") or 0) < pct or not limit_applies(x, st.get("model_id")):
                 continue
-            resets.append(float(reset) if reset else float("inf"))
         except Exception:
             continue
+        try:
+            reset = float(x.get("reset"))
+        except Exception:
+            resets.append(float("inf"))
+            continue
+        if now < reset:
+            resets.append(reset)
     return max(resets) if resets else None
+
+
+def on_subscription(st):
+    """Subscription limits (not just a gateway's spend limit) were passed for this session."""
+    return any(isinstance(x, dict) and x.get("scope") != "Spend limit" for x in st.get("limits") or [])
+
+
+def keepwarm_worth_it(st, cfg, ttl):
+    """False for a subscription on a 5m cache (usually extra-usage credits: pings every 4 min rarely pay) and for
+    histories over keepwarm_max_tokens (left to Claude Code's idle compaction, which shrinks them while warm)."""
+    if ttl == "5m" and on_subscription(st):
+        return False
+    try:
+        return int(st.get("recache_tokens_if_cold") or 0) <= int(cfg.get("keepwarm_max_tokens", 700000))
+    except Exception:
+        return True
 
 
 def keepwarm_allowance(cfg, model_id, tokens, ttl):
@@ -768,6 +819,8 @@ def hook_keepwarm():
         kw.update(keepwarm_pings=0, keepwarm_since=armed)  # the user was here since the last ping: a new stretch
     kw["keepwarm_armed"] = token
     save_keepwarm(sid, kw)
+    if not keepwarm_worth_it(st, cfg, ttl):
+        return
     ttl_secs, lead, transcript = TTL_SECONDS[ttl], keepwarm_lead(ttl, cfg), st.get("transcript_path")
     baseline = []
 
@@ -809,7 +862,8 @@ def hook_keepwarm():
         lock = keepwarm_lockout(load_state(sid), cfg, now_)
         if lock is None:
             return e - lead
-        return max(e - lead, lock + KEEPWARM_RESET_MARGIN) if lock + KEEPWARM_RESET_MARGIN < e else None
+        after = lock + KEEPWARM_RESET_MARGIN
+        return max(e - lead, after) if after <= e - min(lead, KEEPWARM_EXPIRY_GAP) else None
 
     while True:  # wall clock, so a Mac that slept is noticed
         target = ping_time()
@@ -827,13 +881,8 @@ def hook_keepwarm():
     tokens, model = st.get("recache_tokens_if_cold"), st.get("model_id")
     if not tokens:
         return
-    if ttl == "5m" and st.get("limits"):
-        return  # a subscription on a 5m cache is usually on extra-usage credits: pings every 4 min rarely pay
-    try:
-        if int(tokens) > int(cfg.get("keepwarm_max_tokens", 700000)):
-            return  # leave it to Claude Code's idle compaction, which shrinks it while the cache is warm
-    except Exception:
-        pass
+    if not keepwarm_worth_it(st, cfg, ttl):
+        return
     usd, _ = cold_cost(cfg, model, tokens, ttl)
     if not over_cold_floor(cfg, tokens, usd):
         return
@@ -865,27 +914,40 @@ def hook_subagent_stop():
     except Exception:
         floor = 0.0
     tp, aid = data.get("transcript_path"), str(data.get("agent_id") or "")
-    if floor <= 0 or not tp or not aid or not re.fullmatch(r"[\w.-]+", aid):
+    if floor <= 0 or not aid or not re.fullmatch(r"[\w.-]+", aid):
         return
-    base = Path(tp).parent / Path(tp).stem
-    f = base / "subagents" / f"agent-{aid}.jsonl"
-    if not f.is_file():
-        f = next((x for x in base.rglob(f"agent-{aid}.jsonl")), None) if base.is_dir() else None
-    if not f:
+    f = Path(data["agent_transcript_path"]) if data.get("agent_transcript_path") else None
+    if not (f and f.is_file()) and tp:
+        base = Path(tp).parent / Path(tp).stem
+        f = base / "subagents" / f"agent-{aid}.jsonl"
+        if not f.is_file():
+            f = next((x for x in base.rglob(f"agent-{aid}.jsonl")), None) if base.is_dir() else None
+    if not (f and f.is_file()):
         return
     table = price_table(cfg)
     reqs = load_requests(f, sidechain=True)
     s = summarise(reqs, table)
     cost = total_cost(s)
-    if cost < floor:
-        return
-    models = ", ".join(sorted({short_model(r["model"]) for r in reqs})) or "?"
+    level = int(cost // floor)
+    seen_path = state_path(data.get("session_id")).with_name(f"{state_path(data.get('session_id')).stem}.subagents.json")
+    seen = read_json(seen_path) if seen_path.exists() else None
+    seen = seen if isinstance(seen, dict) else {}
+    if level < 1 or level <= int(seen.get(aid) or 0):
+        return  # cheap, or already warned at this level (an agent continued later is priced in full again)
+    seen[aid] = level
+    try:
+        write_json_atomic(seen_path, seen)
+    except Exception:
+        pass
+    names = sorted({short_model(r["model"]) for r in reqs})
     kind = data.get("agent_type") or "subagent"
-    emit({"systemMessage": (
-        f"cache-guard: that {kind} subagent cost {fmt_usd(cost)} at API list price "
-        f"({len(reqs)} requests on {models}). Subagents run on your session's model unless told otherwise: "
-        f"CLAUDE_CODE_SUBAGENT_MODEL=sonnet (or haiku) in settings env, or a model in the agent's definition, "
-        f"makes runs like this far cheaper.")})
+    text = (f"cache-guard: that {kind} subagent has cost {fmt_usd(cost)} at API list price "
+            f"({len(reqs)} requests on {', '.join(names) or '?'}).")
+    pricey = any(m.split("-")[0] in ("fable", "opus") for m in names)
+    if pricey and not os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"):
+        text += (" Subagents run on your session's model unless told otherwise: CLAUDE_CODE_SUBAGENT_MODEL=sonnet "
+                 "(or haiku) in settings env, or a model in the agent's definition, makes runs like this far cheaper.")
+    emit({"systemMessage": text})
 
 
 def short_model(m):
@@ -1353,7 +1415,7 @@ def cmd_doctor():
     if mcp_count:
         notes.append(f"{mcp_count} MCP server(s) configured. Fine with tool search on; don't toggle them mid-task.")
 
-    if not env.get("CLAUDE_CODE_SUBAGENT_MODEL"):
+    if not env.get("CLAUDE_CODE_SUBAGENT_MODEL") and not re.search(r"sonnet|haiku", str(model or ""), re.I):
         on = f" ({model})" if model else ""
         notes.append(f"Subagents run on your session's model{on}, the built-in Explore agent included since v2.1.198. "
                      "For exploring and searching, CLAUDE_CODE_SUBAGENT_MODEL=sonnet or haiku in settings env (plus "
@@ -1393,13 +1455,16 @@ SIGNALS_TOOLS = ("deferred_tools_delta", "mcp_instructions_delta")
 SIGNALS = SIGNALS_RESTART + SIGNALS_TOOLS
 EXPECTED = ("start", "compaction")
 BLOCKS_LOOKBACK = 20  # a cache breakpoint looks back at most 20 blocks for an earlier entry
+USER_LINE = re.compile(r'"type":\s*"user"')
+SIDECHAIN_LINE = re.compile(r'"isSidechain":\s*true')
+TOOL_RESULT = re.compile(r'"type":\s*"tool_result"')
 KIND_LABELS = {
     "idle": "idle past the cache TTL",
     "model": "model switch",
     "restart": "session resumed or restarted",
     "tools": "tools or MCP servers changed (likely)",
     "unknown": "prefix changed, cause not in transcript",
-    "blocks": "20+ blocks in one turn (Claude Code issue)",
+    "blocks": ">20 blocks in one turn (Claude Code issue)",
     "compaction": "after compaction (expected)",
     "start": "session start (expected)",
 }
@@ -1451,7 +1516,11 @@ class RequestReader:
         self.stale = False   # status line: a line re-logged one of those, so the file must be read again
 
     def feed(self, line):
-        self.blocks += line.count('"tool_use_id"')  # tool results added since the last request, without parsing
+        if "tool_result" in line:  # tool results since the last request, counted without parsing the line
+            head = line[:400]
+            side = SIDECHAIN_LINE.search(head if '"isSidechain"' in head else line)
+            if USER_LINE.search(head) and bool(side) == self.sidechain:
+                self.blocks += len(TOOL_RESULT.findall(line))
         if ('"usage"' not in line and '"compact_boundary"' not in line
                 and '"isCompactSummary"' not in line and not any(s in line for s in SIGNALS)):
             return  # skip the bulk of the file without parsing it
@@ -1605,9 +1674,9 @@ def rebuild_step(prev, r, ttl):
         kind, cause = "restart", KIND_LABELS["restart"]
     elif r["signals"] & set(SIGNALS_TOOLS):
         kind, cause = "tools", KIND_LABELS["tools"]
-    elif r.get("blocks", 0) > BLOCKS_LOOKBACK:
-        kind, cause = "blocks", (f"the turn before added {r['blocks']} content blocks; Claude Code misses the cache "
-                                 f"past {BLOCKS_LOOKBACK} (known issue)")
+    elif 2 * r.get("blocks", 0) > BLOCKS_LOOKBACK:  # each tool result comes with its tool call
+        kind, cause = "blocks", (f"the turn before returned {r['blocks']} tool results ({2 * r['blocks']} content "
+                                 f"blocks); Claude Code misses the cache past {BLOCKS_LOOKBACK} (known 20-block issue)")
     else:
         kind, cause = "unknown", "prefix changed (cause not in transcript; /usage may know)"
     return {"req": r, "kind": kind, "tokens": tokens, "cause": cause}, ttl
@@ -1778,10 +1847,10 @@ def report_all(days):
         sys.exit(f"No transcripts from the last {days:g} days under {root}.")
     table = price_table(load_config())
     main, sub, runs, by_kind, sessions = new_summary(), new_summary(), [], {}, []
-    main_reqs = []
+    whatif = {}
     for p in files:
         reqs = load_requests(p)
-        main_reqs.append(reqs)
+        whatif_add(whatif, 0, reqs, table)
         add_summary(main, summarise(reqs, table))
         avoid_tokens, avoid_usd, kinds = 0, 0.0, {}
         for x in find_rebuilds(reqs, table):
@@ -1799,6 +1868,7 @@ def report_all(days):
             rr = load_requests(f, sidechain=True)
             if rr:
                 runs.append(rr)
+                whatif_add(whatif, 1, rr, table)
                 add_summary(sub, summarise(rr, table))
 
     print(f"{BOLD}cache-guard report{RST}  last {days:g} days: {len(files)} sessions, {len(runs)} subagent runs")
@@ -1830,28 +1900,29 @@ def report_all(days):
         print(f"  {DIM}Details: cache_guard.py report <session id>{RST}")
 
     print_ttl_whatif(runs, table, total_cost(sub))
-    print_model_whatif(main_reqs, runs, table)
+    print_model_whatif(whatif, table)
 
 
 WHATIF_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 
 
-def print_model_whatif(main_reqs, runs, table):
+def whatif_add(sums, which, reqs, table):
+    """Add `reqs` repriced on each WHATIF_MODELS model to sums[model][which] (0 main, 1 subagents)."""
+    for m in WHATIF_MODELS:
+        row = sums.setdefault(m, [0.0, 0.0])
+        for r in reqs:
+            if price_for(table, r["model"], 0):  # only what the report priced
+                c = req_cost(dict(r, model=m), table)
+                row[which] += sum(c.values()) if c else 0.0
+
+
+def print_model_whatif(sums, table):
     """The same tokens repriced on one model each: what moving work to a cheaper model would have cost."""
     print(f"\n{BOLD}Same tokens on one model{RST} {DIM}(API list prices; quality not compared){RST}")
     for m in WHATIF_MODELS:
-        if not price_for(table, m, 0):
-            continue
-        parts = []
-        for groups in (main_reqs, runs):  # each a list of sessions' or runs' requests
-            usd = 0.0
-            for reqs in groups:
-                for r in reqs:
-                    if price_for(table, r["model"], 0):  # only what the report priced
-                        c = req_cost(dict(r, model=m), table)
-                        usd += sum(c.values()) if c else 0.0
-            parts.append(usd)
-        print(f"  {m:20} main {fmt_usd(parts[0]):>9}   subagents {fmt_usd(parts[1]):>9}   total {fmt_usd(sum(parts)):>9}")
+        if m in sums and price_for(table, m, 0):
+            a, b = sums[m]
+            print(f"  {m:20} main {fmt_usd(a):>9}   subagents {fmt_usd(b):>9}   total {fmt_usd(a + b):>9}")
 
 
 def cmd_report(args):
