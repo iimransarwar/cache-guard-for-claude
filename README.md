@@ -6,26 +6,26 @@ Every turn, Claude Code re-sends your whole conversation. Prompt caching bills t
 
 cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, can keep a long session warm while you're away, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 200](https://img.shields.io/badge/tests-200%20checks-2ea44f)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 222](https://img.shields.io/badge/tests-222%20checks-2ea44f)
 
 ```
-Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 42% left (5h, out in ~40m) · 82% left (week)
+Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | ctx 337k · $0.07/turn | All models: 42% left (5h, out in ~40m) · 82% left (week)
 30d at API prices: $4,310 (would be $38,520 without cache, -89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
-tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before it resets (15:10). /effort low and fewer subagents stretch it.
+tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before it resets (15:10). The lockout outlasts the cache: /compact or write a handoff before then, or rebuilding ~337k after the reset costs the full price (~$2.70).
 ```
 
 *Example figures. Costs are at API list price; on a subscription they show relative size, not a bill.*
 
 ## What you get
 
-- **See the money, live.** `cache cut $60.50 → $12.40` is what this session would have cost without the cache, then what it did cost. `avoidable $1.90` is what was spent rebuilding a cache that should have been read.
+- **See the money, live.** `cache cut $60.50 → $12.40` is what this session would have cost without the cache, then what it did cost. `avoidable $1.90` is what was spent rebuilding a cache that should have been read. `ctx 337k · $0.07/turn` is what every turn pays just to re-read your history, so you see a session getting expensive long before the context fills up.
 - **Every project at a glance.** A second line prices the last 30 days across every project at API rates, shows what it would have cost without the cache, and names the three projects where caching saved the most. It's refreshed in the background, so the status line never slows down.
-- **Know before you hit the wall.** A pace forecast measures how fast your 5-hour limit is rising right now and says `out in ~40m` when you'd run out before the reset. Idle hours never skew it, and it stays silent when you're fine.
-- **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache says how much it would re-read and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task.
-- **Come back to a warm cache.** Opt in with `--keepwarm` and, while you're away, cache-guard wakes Claude for a one-word reply just before the cache expires. On a 1-hour cache that's about one ping an hour, a few cents each against dollars for a rebuild. It stops on its own once the pings would cost more than one rebuild, after 12 hours, or as soon as you're back.
+- **Know before you hit the wall.** A pace forecast measures how fast your 5-hour limit is rising right now and says `out in ~40m` when you'd run out before the reset. If the lockout would outlast your cache, it tells you to compact or write a handoff first, while re-reading is still cheap. Idle hours never skew it, and it stays silent when you're fine.
+- **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache says how much it would re-read and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task. A subagent run that costs $5 or more tells you so, and how to put subagents on a cheaper model.
+- **Come back to a warm cache.** Opt in with `--keepwarm` and, while you're away, cache-guard wakes Claude for a one-word reply just before the cache expires. On a 1-hour cache that's about one ping an hour, a few cents each against dollars for a rebuild. It stops on its own once the pings would cost more than one rebuild, after 12 hours, or as soon as you're back. Near a usage limit it only pings if the limit resets before the cache expires, so a short lockout doesn't cost you the cache and a long one doesn't cost you the last of your quota.
 - **A budget, if you want one.** Set `session_budget_usd` and you're told when a session, subagents included, passes it, and again at each multiple. Or have the message stopped once.
 - **A doctor for your setup.** It finds settings that silently break caching, adds up the CLAUDE.md files, imports, memory and rules loaded into every session, flags API keys and passwords sitting in them, and spots proxies that can rewrite your requests.
-- **Reports that explain the bill.** `report` lists every real cache miss with its likely cause and cost. `report --all` splits 30 days of spend by cause and subagents, and tells you whether a 5-minute or 1-hour subagent cache would have been cheaper on your own history.
+- **Reports that explain the bill.** `report` lists every real cache miss with its likely cause and cost. `report --all` splits 30 days of spend by cause and subagents, tells you whether a 5-minute or 1-hour subagent cache would have been cheaper on your own history, and what the same work would have cost on Opus, Sonnet or Haiku.
 
 ## Why not a proxy, a keep-warm bot or a usage bar?
 
@@ -49,7 +49,7 @@ There are other ways to attack the same problem. Each one gives up something cac
 - **No proxy, no token.** It never sits in front of your API traffic and never reads your login credentials.
 - **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, the Lean output style changes how Claude writes its replies, and keep-warm wakes Claude for a one-word reply while you're away.
 - **Your settings, backed up.** Install backs up `settings.json`, keeps your own hooks, and uninstalls in one command.
-- **Readable.** One file, standard library only, with a 200-check test suite that runs against a throwaway home folder.
+- **Readable.** One file, standard library only, with a 222-check test suite that runs against a throwaway home folder.
 
 ## Install
 
@@ -91,9 +91,9 @@ Install copies the script to `~/.claude/cache-guard/`, backs up `~/.claude/setti
 Three lines, refreshed every 30 seconds:
 
 ```
-Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | All models: 42% left (5h, out in ~40m) · 82% left (week)
+Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | ctx 337k · $0.07/turn | All models: 42% left (5h, out in ~40m) · 82% left (week)
 30d at API prices: $4,310 (would be $38,520 without cache, -89%) | most saved: api-server $13.1k · web-app $11.8k · docs-site $1.9k
-tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before it resets (15:10). /effort low and fewer subagents stretch it.
+tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before it resets (15:10). The lockout outlasts the cache: /compact or write a handoff before then, or rebuilding ~337k after the reset costs the full price (~$2.70).
 ```
 
 The money figures are for the current session at API list prices. On a subscription they show relative size, not a bill.
@@ -104,6 +104,8 @@ The money figures are for the current session at API list prices. On a subscript
 Requests on models without a price are left out of every figure, as in `report`. If nothing in the session can be priced, the block is left out. The status line keeps running totals in its state file and reads only what the transcripts gained since the last refresh. It spends at most half a second reading per refresh. If a refresh runs out of time (the first one on a very large session, for example), it shows the last figures it had, or none yet, and carries on at the next refresh. An error leaves the block out, never the line. Turn it off with `statusline_cost`.
 
 **All-projects line**: what every session in every project cost over the last `totals_days` days (default 30) at API list prices, main conversations and subagents included, then what the same calls would have cost without the cache, then the three projects caching saved the most in. On a subscription it is not your bill; it shows what the same usage would cost on the API. The figures match `report --all --days 30` (its two cost rows added together). Projects are named after the folder the session ran in. Reading 30 days of transcripts can take several seconds, so the status line never does it itself: it shows the last saved figures, and when they are over `totals_refresh_minutes` old (default 10) it starts one scan in the background. A lock file makes sure several open sessions start only one scan between them; a running scan keeps its lock fresh, and a scan that dies or fails frees it after 5 minutes. After the first scan, only transcripts that changed are read again. Until the first scan finishes the line says `counting…`. With nothing priced, the line is left out. Turn it off with `statusline_totals`.
+
+**Context meter**: from `context_meter_tokens` (200k) of history the line adds `ctx 337k · $0.07/turn`, what re-reading the history costs every turn at list price, before anything new is said. It turns yellow from `context_warn_tokens` (400k). On a 1M-token window the old 75% warning only fired at 750k, after most of the cost.
 
 Usage limits show as percent left, named for whom they apply to. When a limit has both a 5-hour and a weekly window, each says which it is, as in `All models: 58% left (5h) · 82% left (week)`. A limit for a single model comes first, under that model's name, for example `Fable: 61% left`. Behind a Claude apps gateway, a spend limit shows as `Spend limit: 37% left`. Any other limit Claude Code passes in the same shape is shown too, named from its key (`seven_day_fable` would read as the weekly Fable limit). A limit turns yellow at `limit_warn_pct` used (default 80%) and red at 90% used. With no limit data, on an API key for example, this part is left out.
 
@@ -118,7 +120,7 @@ The tip is the most urgent of these:
 3. At the current pace a usage limit runs out before it resets: says when, and how long before the reset.
 4. A usage limit over 80% used: names the limit, says how much is left and when it resets, and suggests avoiding expensive actions until then.
 5. The cause of a miss in the last 10 minutes.
-6. Context above 75%: `/compact` at your next break.
+6. Context above 75% of the window, or a history over `context_warn_tokens` (400k): `/clear` for a new task, `/compact` at your next break, with what each turn costs to re-read.
 7. Otherwise, a rotating tip from 26 do's and don'ts.
 
 ### Guards (hooks)
@@ -130,7 +132,8 @@ The tip is the most urgent of these:
 | Cold message | When you type into a session whose cache has gone cold and whose history would cost at least `cold_prompt_warn_usd` ($0.50) to re-read, you get a warning. The floor is in dollars because 100k tokens costs very different amounts on Haiku and Opus; models without a price fall back to `cold_prompt_warn_tokens` (100k). The warning says how long the cache has been cold, how many tokens the message re-reads and what that costs at list price. For a new task, `/clear` first is far cheaper. The message itself goes through. Set `cold_prompt` to `block` to have it stopped once instead; you then send it again within 2 minutes to go ahead. Slash commands, loops, scheduled tasks and SDK prompts are never touched. |
 | Session budget (opt-in) | Set `session_budget_usd` and typed messages get a warning when the session's list-price cost (main conversation plus subagents) passes it, and again at 2×, 3× and so on. The status line adds `over $25 budget` in red. Set `session_budget_action` to `block` to have the message stopped once instead; send it again within 2 minutes to go ahead. If the cache is also cold, both warnings arrive as one message. It keeps working with `statusline_cost` off. |
 | Resume | Warns when a resume re-sends a big history after the cache has expired. |
-| Keep-warm (opt-in, `--keepwarm`) | A background Stop hook. After each of Claude's turns it waits quietly; if you haven't typed by shortly before the cache expires (`keepwarm_lead_minutes`, 5, before a 1h cache runs out; 1 minute before a 5m one), it wakes Claude with *reply with only: ok, no tools, no task*. That reply reads the cache, which resets its timer. It only pings when the rebuild would pass the cold-message floor, stops once the pings would add up to more than one rebuild (about 38 on a 1h Opus 5.5 cache, about 1.7 hours' worth on a 5m one; models without a price get a conservative cap) or after `keepwarm_max_hours` (12), with a 24-hour cap on top. It won't ping once the cache has gone cold, going by Claude Code's own expiry time (a Mac that slept through, a long final reply), or a session you closed. Any new turn cancels it: typing, a `/loop`, a scheduled task. Each ping is a full turn, so your other Stop hooks run after it too, and Claude Code may show its waiting-for-input notification. The status line shows `kept warm ×3` while it's working. Your Mac has to stay awake: run `caffeinate -i` while you're away. |
+| Subagent cost | When one subagent run costs at least `subagent_warn_usd` ($5) at list price, tells you what it cost, on which model, and how to make subagents cheaper (`CLAUDE_CODE_SUBAGENT_MODEL`, or a model in the agent's definition). |
+| Keep-warm (opt-in, `--keepwarm`) | A background Stop hook. After each of Claude's turns it waits quietly; if you haven't typed by shortly before the cache expires (`keepwarm_lead_minutes`, 5, before a 1h cache runs out; 1 minute before a 5m one), it wakes Claude with *reply with only: ok, no tools, no task*. That reply reads the cache, which resets its timer. It only pings when the rebuild would pass the cold-message floor, stops once the pings would add up to more than one rebuild (about 38 on a 1h Opus 5.5 cache, about 1.7 hours' worth on a 5m one; models without a price get a conservative cap) or after `keepwarm_max_hours` (12), with a 24-hour cap on top. It won't ping once the cache has gone cold, going by Claude Code's own expiry time (a Mac that slept through, a long final reply), or a session you closed. Any new turn cancels it: typing, a `/loop`, a scheduled task. Each ping is a full turn, so your other Stop hooks run after it too, and Claude Code may show its waiting-for-input notification. Near a usage limit (`keepwarm_limit_pct`, 95% used) it pings only when the limit resets before the cache expires, waiting until just after the reset; when the lockout would outlast the cache, it stands down. On a subscription, a 5-minute cache usually means extra-usage credits, so it stands down there too (API-key sessions on a 5m cache are still kept warm). Histories over `keepwarm_max_tokens` (700k) are left to Claude Code's idle compaction, which shrinks them while the cache is still warm. The status line shows `kept warm ×3` while it's working. Your Mac has to stay awake: run `caffeinate -i` while you're away. |
 | Bash trimmer (opt-in) | Output over 12,000 chars keeps its first 30 lines, last 60 lines and every error or warning line. The full log is saved to `~/.claude/cache-guard/logs/` and Claude is told where. Add `# no-trim` to a command to skip trimming. |
 
 The hooks only show messages to you. They never inject text into Claude's context, so they can't break the cache themselves. The one exception is opt-in keep-warm, whose ping asks Claude for a one-word reply.
@@ -147,13 +150,14 @@ Scans for settings that silently break the cache, waste tokens or leak secrets:
 - everything loaded into every session, added up: CLAUDE.md files here and in parent folders, their `@imports`, this folder's auto-memory `MEMORY.md`, and rules without a `paths:` scope. Over 15k tokens is flagged.
 - secrets in those files and in memory files (API keys, tokens, private keys, `password=` lines), by file and line. The value itself is never printed, and references such as `${VAR}` or `process.env.X` are not flagged.
 - request interceptors: `NODE_OPTIONS` preloading code, `HTTPS_PROXY` with its own certificate, or `ANTHROPIC_BASE_URL` on localhost. They can rewrite TTLs and cache markers, so the figures you see may not be what Anthropic billed. Proxy and base URLs are printed with any password hidden.
+- subagents (the built-in Explore agent included, since v2.1.198) running on your session's model because `CLAUDE_CODE_SUBAGENT_MODEL` isn't set
 - missing output caps
 
 ### `report`
 
 **`report [session-id | path.jsonl]`** shows one session: tokens, cache hit rate, cost at list price, and every real cache miss with a likely cause (idle past the TTL, a model switch, a resume or restart, changed tools, or unknown). It then shows the same totals for the session's subagents and names the three most expensive ones. With no argument it uses the latest session for the current folder. The start of a session id is enough.
 
-A miss is a request whose cached prefix shrank, the same test Claude Code's own miss counter uses. A large write on a warm cache is new content, not a miss, and is not listed. Session start and compaction are shown separately as expected writes.
+A miss right after a turn that added more than 20 content blocks (a burst of parallel tool calls, say) is labelled as Claude Code's known 20-block cache issue rather than "cause not in transcript". A miss is a request whose cached prefix shrank, the same test Claude Code's own miss counter uses. A large write on a warm cache is new content, not a miss, and is not listed. Session start and compaction are shown separately as expected writes.
 
 **`report --all [--days N]`** covers every session from the last N days (default 30):
 
@@ -161,6 +165,7 @@ A miss is a request whose cached prefix shrank, the same test Claude Code's own 
 - cache rebuilds grouped by cause, with their share of main-conversation cost
 - the five sessions with the most avoidable rebuilds
 - a verdict on subagent cache length: what the other setting (5m or 1h) would have cost on your own transcripts, and whether to change `subagentPromptCacheTtl`
+- the same tokens repriced on Opus 5.5, Sonnet 5.5 and Haiku 5.5, as a guide to what moving work to a cheaper model would save (quality not compared)
 
 Costs use API list prices built into the script. On a subscription they show relative size, not a bill.
 
@@ -178,10 +183,15 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `notify_minutes` | 3 | How early to alert |
 | `expiry_warn_minutes` | 3 | When the status line warns about expiry |
 | `context_warn_pct` | 75 | When to suggest `/compact` |
+| `context_meter_tokens` | 200000 | History size from which the status line shows its per-turn re-read cost |
+| `context_warn_tokens` | 400000 | History size at which that turns yellow and the tip suggests `/clear` or `/compact` |
+| `subagent_warn_usd` | 5 | Tell you when one subagent run costs at least this at list price; 0 = off |
 | `limit_warn_pct` | 80 | Share of a usage limit used (%) at which it turns yellow and the tip warns (red from 90%) |
 | `keepwarm` | false | Keep the cache warm while you're away (`install --keepwarm` sets it and wires the hook) |
 | `keepwarm_lead_minutes` | 5 | On a 1h cache, how long before it expires to ping (a 5m cache always uses 1 minute) |
 | `keepwarm_max_hours` | 12 | Stop keeping a session warm after this long away |
+| `keepwarm_limit_pct` | 95 | A usage limit this used: only ping if it resets before the cache expires |
+| `keepwarm_max_tokens` | 700000 | Larger histories are left to Claude Code's idle compaction |
 | `pace_forecast` | true | Say when the recent pace uses a 5-hour limit up before it resets |
 | `pace_window_minutes` | 30 | How far back the pace is measured |
 | `resume_warn_tokens` | 50000 | Minimum history size for the resume warning |
@@ -214,7 +224,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ### Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 200 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 222 checks against a throwaway HOME
 ```
 
 ### Caveats

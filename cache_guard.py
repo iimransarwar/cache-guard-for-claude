@@ -28,6 +28,7 @@ Hook entry points (wired by install; you never call these yourself)
                       prompts are never touched.
   hook-session-start  SessionStart: warn when a resume re-sends a big, expired history.
   hook-trim           PostToolUse (Bash): trim huge output, keep errors, save the full log.
+  hook-subagent-stop  SubagentStop: tell you when one subagent run cost more than subagent_warn_usd.
   hook-keepwarm       Stop, in the background (opt-in): while you're away, wake Claude for a one-word reply just
                       before the cache expires, as long as that costs less than a rebuild.
 
@@ -48,7 +49,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 GUARD_DIR = CLAUDE_DIR / "cache-guard"
@@ -72,6 +73,11 @@ DEFAULT_CONFIG = {
     "keepwarm": False,           # keep the cache warm while you're away (install --keepwarm wires the hook)
     "keepwarm_lead_minutes": 5,  # on a 1h cache, ping this long before it expires (a 5m cache: 1 minute)
     "keepwarm_max_hours": 12,    # stop keeping a session warm after this long away
+    "keepwarm_limit_pct": 95,    # a usage limit this used: only ping if it resets before the cache expires
+    "keepwarm_max_tokens": 700000,  # larger histories are left to Claude Code's idle compaction
+    "context_meter_tokens": 200000,  # show the history size and its per-turn re-read cost from this size
+    "context_warn_tokens": 400000,   # ...in yellow, with a /clear or /compact tip, from this size
+    "subagent_warn_usd": 5,      # tell you when one subagent run costs at least this at list price (0 = off)
     "pace_forecast": True,       # say when the recent pace uses a limit up before it resets
     "pace_window_minutes": 30,   # how far back the pace is measured
     "resume_warn_tokens": 50000, # warn on resume when re-sending more than this, uncached
@@ -518,6 +524,7 @@ def cmd_statusline():
     if misses > int(state.get("misses_seen", 0)):
         state["miss_seen_at"] = now
     model_id = (data.get("model") or {}).get("id")
+    state["limits"] = [{"used": x["used"], "reset": x["reset"]} for x in limits]
     state.update({"misses_seen": misses, "warm": warm, "expires_at": exp, "ttl": ttl,
                   "recache_tokens_if_cold": recache, "model": model, "model_id": model_id,
                   "caching_observed": bool(pc.get("caching_observed", True)), "updated": now})
@@ -543,7 +550,18 @@ def cmd_statusline():
     kept = int(kw.get("keepwarm_pings") or 0) if (float(kw.get("keepwarm_fired_at") or 0)
                                                    > float(kw.get("last_prompt_at") or 0)) else 0
     kept_txt = f", kept warm ×{kept}" if kept else ""
-    line1 = f"{model} | cache {pct} ({cache_txt}, ttl {ttl}{kept_txt}){cost_txt} | misses {misses}{limits_txt}"
+    ctx_txt, turn_usd = "", None
+    try:
+        if recache and int(recache) >= int(cfg.get("context_meter_tokens", 200000)):
+            p = price_for(price_table(cfg), model_id, int(recache))
+            turn_usd = int(recache) * p[3] / 1e6 if p else None
+            big = int(recache) >= int(cfg.get("context_warn_tokens", 400000))
+            txt = f"ctx {fmt_tokens(recache)}" + (f" · {fmt_usd(turn_usd)}/turn" if turn_usd is not None else "")
+            ctx_txt = f" | {YEL}{txt}{RST}" if big else f" | {txt}"
+    except Exception:
+        ctx_txt = ""
+    line1 = (f"{model} | cache {pct} ({cache_txt}, ttl {ttl}{kept_txt}){cost_txt} | misses {misses}"
+             f"{ctx_txt}{limits_txt}")
     if not warm and recache:
         usd, _ = cold_cost(cfg, model_id, recache, ttl)
         line1 += f" | next msg re-reads ~{fmt_tokens(recache)}" + (f" (~{fmt_usd(usd)})" if usd else "")
@@ -571,8 +589,15 @@ def cmd_statusline():
         x = min((x for x in limits if pace_key(x) in pace), key=lambda x: pace[pace_key(x)])
         secs, name = pace[pace_key(x)], limit_name(x)
         tip = (f"{YEL}At this pace the {name[0].lower() + name[1:]} runs out in ~{fmt_gap(secs)}{RST}, "
-               f"{fmt_gap(float(x['reset']) - now - secs)} before it resets ({fmt_clock(x['reset'])}). "
-               f"/effort low and fewer subagents stretch it.")
+               f"{fmt_gap(float(x['reset']) - now - secs)} before it resets ({fmt_clock(x['reset'])}). ")
+        ttl_secs = TTL_SECONDS.get(ttl)
+        if ttl_secs and float(x["reset"]) - now - secs > ttl_secs:
+            usd, _ = cold_cost(cfg, model_id, recache, ttl) if recache else (None, None)
+            redo = f" (~{fmt_usd(usd)})" if usd else ""
+            tip += (f"The lockout outlasts the cache: /compact or write a handoff before then, or rebuilding "
+                    f"~{fmt_tokens(recache)} after the reset costs the full price{redo}.")
+        else:
+            tip += "The cache will still be warm when it resets. /effort low and fewer subagents stretch it."
     elif hot_limit:
         left = f"{hot_limit['left']:.0f}"
         when = f" (resets {fmt_clock(hot_limit['reset'])})" if hot_limit["reset"] else ""
@@ -588,9 +613,14 @@ def cmd_statusline():
             tip = "Last miss: thinking settings changed. Set thinking at session start, not mid-task."
         else:
             tip = f"Last miss cause: {c}. Run /usage for details."
-    elif cpct is not None and cpct >= cfg["context_warn_pct"]:
-        tip = (f"{YEL}Context {cpct:.0f}% full.{RST} /compact at your next natural break, "
-               f"before auto-compact fires mid-task.")
+    elif cpct is not None and cpct >= cfg["context_warn_pct"] or ctx_txt.startswith(f" | {YEL}"):
+        if cpct is not None and cpct >= cfg["context_warn_pct"]:
+            tip = (f"{YEL}Context {cpct:.0f}% full.{RST} /compact at your next natural break, "
+                   f"before auto-compact fires mid-task.")
+        else:
+            each = f" (~{fmt_usd(turn_usd)} at list price)" if turn_usd is not None else ""
+            tip = (f"{YEL}Context {fmt_tokens(recache)}:{RST} every turn re-reads it{each}. New task? /clear. "
+                   f"Same task? /compact at your next break.")
     else:
         tip = rotating
     print(f"{DIM}tip:{RST} {tip}")
@@ -652,6 +682,7 @@ KEEPWARM_PING_TOKENS = (200, 20)  # rough tokens a ping adds to the cache, and i
 KEEPWARM_SETTLE = 10.0        # transcript writes this soon after a turn ends belong to that turn
 KEEPWARM_DEFAULT_ALLOWANCE = {"1h": 20, "5m": 12}  # models without a price: as if reads cost a tenth of input
 KEEPWARM_MARK = "cache-guard keep-warm ping"
+KEEPWARM_RESET_MARGIN = 30.0  # ping this long after a usage limit resets
 KEEPWARM_MSG = (KEEPWARM_MARK + " (automatic: the user is away and this only keeps the prompt cache warm). "
                 "Reply with only: ok. Do not use tools and do not continue any task.")
 
@@ -686,6 +717,25 @@ def keepwarm_lead(ttl, cfg):
     except Exception:
         lead = 300.0
     return float(min(max(lead, min(30.0, secs * 0.5)), secs * 0.95))  # a floor, or the ping lands on a cold cache
+
+
+def keepwarm_lockout(st, cfg, now):
+    """None when no usage limit is at keepwarm_limit_pct; else when the last such limit resets (inf if unknown). The
+    status line's figures only update with the next request, so a limit whose reset time has passed counts as reset."""
+    try:
+        pct = float(cfg.get("keepwarm_limit_pct", 95))
+    except Exception:
+        pct = 95.0
+    resets = []
+    for x in st.get("limits") or []:
+        try:
+            used, reset = float(x.get("used") or 0), x.get("reset")
+            if used < pct or (reset and now >= float(reset)):
+                continue
+            resets.append(float(reset) if reset else float("inf"))
+        except Exception:
+            continue
+    return max(resets) if resets else None
 
 
 def keepwarm_allowance(cfg, model_id, tokens, ttl):
@@ -753,8 +803,21 @@ def hook_keepwarm():
                 return True
         return False
 
-    while time.time() < expiry() - lead:  # wall clock, so a Mac that slept is noticed
-        time.sleep(max(0.0, min(KEEPWARM_POLL, expiry() - lead - time.time())))
+    def ping_time():
+        """Just before expiry; after a usage-limit reset that comes before it; None when a lockout outlasts it."""
+        e, now_ = expiry(), time.time()
+        lock = keepwarm_lockout(load_state(sid), cfg, now_)
+        if lock is None:
+            return e - lead
+        return max(e - lead, lock + KEEPWARM_RESET_MARGIN) if lock + KEEPWARM_RESET_MARGIN < e else None
+
+    while True:  # wall clock, so a Mac that slept is noticed
+        target = ping_time()
+        if target is None:
+            return  # locked out past the expiry: the cache can't be saved, and a ping would spend the last quota
+        if time.time() >= target:
+            break
+        time.sleep(max(0.0, min(KEEPWARM_POLL, target - time.time())))
         if stood_down() or not keepwarm_on(load_config()):
             return
     now = time.time()
@@ -764,6 +827,13 @@ def hook_keepwarm():
     tokens, model = st.get("recache_tokens_if_cold"), st.get("model_id")
     if not tokens:
         return
+    if ttl == "5m" and st.get("limits"):
+        return  # a subscription on a 5m cache is usually on extra-usage credits: pings every 4 min rarely pay
+    try:
+        if int(tokens) > int(cfg.get("keepwarm_max_tokens", 700000)):
+            return  # leave it to Claude Code's idle compaction, which shrinks it while the cache is warm
+    except Exception:
+        pass
     usd, _ = cold_cost(cfg, model, tokens, ttl)
     if not over_cold_floor(cfg, tokens, usd):
         return
@@ -784,6 +854,42 @@ def hook_keepwarm():
     save_keepwarm(sid, kw)
     sys.stderr.write(KEEPWARM_MSG + "\n")
     sys.exit(2)
+
+
+def hook_subagent_stop():
+    """SubagentStop: when one subagent run cost at least subagent_warn_usd at list price, say so to the user."""
+    data = read_stdin_json()
+    cfg = load_config()
+    try:
+        floor = float(cfg.get("subagent_warn_usd", 5) or 0)
+    except Exception:
+        floor = 0.0
+    tp, aid = data.get("transcript_path"), str(data.get("agent_id") or "")
+    if floor <= 0 or not tp or not aid or not re.fullmatch(r"[\w.-]+", aid):
+        return
+    base = Path(tp).parent / Path(tp).stem
+    f = base / "subagents" / f"agent-{aid}.jsonl"
+    if not f.is_file():
+        f = next((x for x in base.rglob(f"agent-{aid}.jsonl")), None) if base.is_dir() else None
+    if not f:
+        return
+    table = price_table(cfg)
+    reqs = load_requests(f, sidechain=True)
+    s = summarise(reqs, table)
+    cost = total_cost(s)
+    if cost < floor:
+        return
+    models = ", ".join(sorted({short_model(r["model"]) for r in reqs})) or "?"
+    kind = data.get("agent_type") or "subagent"
+    emit({"systemMessage": (
+        f"cache-guard: that {kind} subagent cost {fmt_usd(cost)} at API list price "
+        f"({len(reqs)} requests on {models}). Subagents run on your session's model unless told otherwise: "
+        f"CLAUDE_CODE_SUBAGENT_MODEL=sonnet (or haiku) in settings env, or a model in the agent's definition, "
+        f"makes runs like this far cheaper.")})
+
+
+def short_model(m):
+    return re.sub(r"^claude-", "", str(m))
 
 
 def over_cold_floor(cfg, tokens, usd):
@@ -1247,6 +1353,12 @@ def cmd_doctor():
     if mcp_count:
         notes.append(f"{mcp_count} MCP server(s) configured. Fine with tool search on; don't toggle them mid-task.")
 
+    if not env.get("CLAUDE_CODE_SUBAGENT_MODEL"):
+        on = f" ({model})" if model else ""
+        notes.append(f"Subagents run on your session's model{on}, the built-in Explore agent included since v2.1.198. "
+                     "For exploring and searching, CLAUDE_CODE_SUBAGENT_MODEL=sonnet or haiku in settings env (plus "
+                     "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1 to override agent definitions) is far cheaper.")
+
     # token caps
     if "BASH_MAX_OUTPUT_LENGTH" not in env:
         notes.append("BASH_MAX_OUTPUT_LENGTH not set (default 30,000 chars). Try 15000 to cut noisy logs, "
@@ -1261,7 +1373,8 @@ def cmd_doctor():
         oks.append("cache-guard status line installed.")
     else:
         notes.append("cache-guard status line not installed (run install).")
-    installed = [ev for ev in ("PreModelSwitch", "PreCompact", "UserPromptSubmit", "SessionStart", "PostToolUse", "Stop")
+    installed = [ev for ev in ("PreModelSwitch", "PreCompact", "UserPromptSubmit", "SessionStart", "SubagentStop",
+                               "PostToolUse", "Stop")
                  if any(SCRIPT_NAME in c for c, _ in hooks_by_event.get(ev, []))]
     (oks if installed else notes).append(f"cache-guard hooks: {', '.join(installed) or 'none (run install)'}.")
     oks.append(f"output style: {style or 'Default'}.")
@@ -1279,12 +1392,14 @@ SIGNALS_RESTART = ("session_context", "skill_listing")
 SIGNALS_TOOLS = ("deferred_tools_delta", "mcp_instructions_delta")
 SIGNALS = SIGNALS_RESTART + SIGNALS_TOOLS
 EXPECTED = ("start", "compaction")
+BLOCKS_LOOKBACK = 20  # a cache breakpoint looks back at most 20 blocks for an earlier entry
 KIND_LABELS = {
     "idle": "idle past the cache TTL",
     "model": "model switch",
     "restart": "session resumed or restarted",
     "tools": "tools or MCP servers changed (likely)",
     "unknown": "prefix changed, cause not in transcript",
+    "blocks": "20+ blocks in one turn (Claude Code issue)",
     "compaction": "after compaction (expected)",
     "start": "session start (expected)",
 }
@@ -1331,11 +1446,12 @@ class RequestReader:
     def __init__(self, sidechain=False):
         self.sidechain = sidechain
         self.reqs, self.keys, self.index = [], [], {}
-        self.compact_pending, self.signals = False, set()
+        self.compact_pending, self.signals, self.blocks = False, set(), 0
         self.folded = set()  # status line: digests of requests already added to its running totals
         self.stale = False   # status line: a line re-logged one of those, so the file must be read again
 
     def feed(self, line):
+        self.blocks += line.count('"tool_use_id"')  # tool results added since the last request, without parsing
         if ('"usage"' not in line and '"compact_boundary"' not in line
                 and '"isCompactSummary"' not in line and not any(s in line for s in SIGNALS)):
             return  # skip the bulk of the file without parsing it
@@ -1367,12 +1483,12 @@ class RequestReader:
             "w1": int(cc.get("ephemeral_1h_input_tokens") or 0),
             "read": int(u.get("cache_read_input_tokens") or 0),
             "out": int(u.get("output_tokens") or 0),
-            "after_compact": self.compact_pending, "signals": self.signals,
+            "after_compact": self.compact_pending, "signals": self.signals, "blocks": self.blocks,
         }
         key = msg.get("id") or rec.get("requestId") or rec.get("uuid")
         if key in self.index:  # a streamed response is logged more than once; the last line has the full usage
             old = self.reqs[self.index[key]]
-            row["after_compact"], row["signals"] = old["after_compact"], old["signals"]
+            row["after_compact"], row["signals"], row["blocks"] = old["after_compact"], old["signals"], old.get("blocks", 0)
             self.reqs[self.index[key]] = row
             return
         if self.folded and key_digest(key) in self.folded:
@@ -1381,7 +1497,7 @@ class RequestReader:
         self.index[key] = len(self.reqs)
         self.reqs.append(row)
         self.keys.append(key)
-        self.compact_pending, self.signals = False, set()
+        self.compact_pending, self.signals, self.blocks = False, set(), 0
 
 
 def load_requests(path, sidechain=False):
@@ -1489,6 +1605,9 @@ def rebuild_step(prev, r, ttl):
         kind, cause = "restart", KIND_LABELS["restart"]
     elif r["signals"] & set(SIGNALS_TOOLS):
         kind, cause = "tools", KIND_LABELS["tools"]
+    elif r.get("blocks", 0) > BLOCKS_LOOKBACK:
+        kind, cause = "blocks", (f"the turn before added {r['blocks']} content blocks; Claude Code misses the cache "
+                                 f"past {BLOCKS_LOOKBACK} (known issue)")
     else:
         kind, cause = "unknown", "prefix changed (cause not in transcript; /usage may know)"
     return {"req": r, "kind": kind, "tokens": tokens, "cause": cause}, ttl
@@ -1659,8 +1778,10 @@ def report_all(days):
         sys.exit(f"No transcripts from the last {days:g} days under {root}.")
     table = price_table(load_config())
     main, sub, runs, by_kind, sessions = new_summary(), new_summary(), [], {}, []
+    main_reqs = []
     for p in files:
         reqs = load_requests(p)
+        main_reqs.append(reqs)
         add_summary(main, summarise(reqs, table))
         avoid_tokens, avoid_usd, kinds = 0, 0.0, {}
         for x in find_rebuilds(reqs, table):
@@ -1709,6 +1830,28 @@ def report_all(days):
         print(f"  {DIM}Details: cache_guard.py report <session id>{RST}")
 
     print_ttl_whatif(runs, table, total_cost(sub))
+    print_model_whatif(main_reqs, runs, table)
+
+
+WHATIF_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+
+
+def print_model_whatif(main_reqs, runs, table):
+    """The same tokens repriced on one model each: what moving work to a cheaper model would have cost."""
+    print(f"\n{BOLD}Same tokens on one model{RST} {DIM}(API list prices; quality not compared){RST}")
+    for m in WHATIF_MODELS:
+        if not price_for(table, m, 0):
+            continue
+        parts = []
+        for groups in (main_reqs, runs):  # each a list of sessions' or runs' requests
+            usd = 0.0
+            for reqs in groups:
+                for r in reqs:
+                    if price_for(table, r["model"], 0):  # only what the report priced
+                        c = req_cost(dict(r, model=m), table)
+                        usd += sum(c.values()) if c else 0.0
+            parts.append(usd)
+        print(f"  {m:20} main {fmt_usd(parts[0]):>9}   subagents {fmt_usd(parts[1]):>9}   total {fmt_usd(sum(parts)):>9}")
 
 
 def cmd_report(args):
@@ -2256,6 +2399,7 @@ def cmd_install(flags):
     set_hook("PreCompact", "manual", f"{cmd} hook-compact")
     set_hook("UserPromptSubmit", "", f"{cmd} hook-prompt")
     set_hook("SessionStart", "", f"{cmd} hook-session-start")
+    set_hook("SubagentStop", "", f"{cmd} hook-subagent-stop")
     if trim:
         set_hook("PostToolUse", "Bash", f"{cmd} hook-trim")
     else:
@@ -2270,7 +2414,7 @@ def cmd_install(flags):
     SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
     print(f"Installed cache-guard v{VERSION} to {GUARD_DIR}")
     print("  ✓ status line (refreshes every 30s)")
-    print("  ✓ hooks: model-switch guard, cold /compact guard, cold-message guard, resume warning")
+    print("  ✓ hooks: model-switch guard, cold /compact guard, cold-message guard, resume warning, subagent cost")
     print(f"  {'✓' if trim else '·'} Bash output trimmer {'' if trim else '(off; add --trim)'}")
     print(f"  {'✓' if keepwarm else '·'} keep-warm while you're away {'' if keepwarm else '(off; add --keepwarm)'}")
     others = [h for g in hooks.get("Stop", []) for h in g.get("hooks", []) if SCRIPT_NAME not in (h.get("command") or "")]
@@ -2329,6 +2473,7 @@ def main():
         "hook-session-start": hook_session_start,
         "hook-trim": hook_trim,
         "hook-keepwarm": hook_keepwarm,
+        "hook-subagent-stop": hook_subagent_stop,
         # v1 names, kept so an old settings.json keeps working until you re-run install
         "pre-model-switch": hook_model_switch,
         "pre-compact": hook_compact,
