@@ -6,7 +6,7 @@ Every turn, Claude Code re-sends your whole conversation. Prompt caching bills t
 
 cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, can keep a long session warm while you're away, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 277](https://img.shields.io/badge/tests-277%20checks-2ea44f)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 303](https://img.shields.io/badge/tests-303%20checks-2ea44f)
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | ctx 337k · $0.07/turn | All models: 42% left (5h, out in ~40m) · 82% left (week)
@@ -23,6 +23,7 @@ tip: At this pace the 5-hour limit for all models runs out in ~40m, 2.3h before 
 - **Know before you hit the wall.** A pace forecast measures how fast your 5-hour limit is rising right now and says `out in ~40m` when you'd run out before the reset. If the lockout would outlast your cache, it tells you to compact or write a handoff first, while re-reading is still cheap. Idle hours never skew it, and it stays silent when you're fine.
 - **Guards on the expensive moves.** A model switch on a warm cache asks first. A `/compact` on a cold cache says how much it would re-read and needs a second go. Typing into a big cold session tells you what it will cost, in dollars, and that `/clear` is cheaper for a new task. A subagent run that costs $5 or more tells you so, and how to put subagents on a cheaper model.
 - **Come back to a warm cache.** Opt in with `--keepwarm` and, while you're away, cache-guard wakes Claude for a one-word reply just before the cache expires. On a 1-hour cache that's about one ping an hour, a few cents each against dollars for a rebuild. It stops on its own once the pings would cost more than one rebuild, after 12 hours, or as soon as you're back. Near a usage limit it only pings if the limit resets before the cache expires, so a short lockout doesn't cost you the cache and a long one doesn't cost you the last of your quota.
+- **Pick up cheaply after the cache dies.** Opt in with `--handoff` and, once you've been away a while, Claude writes a short handoff (goal, state, decisions, next steps, key files) while reading the history is still cheap. Come back after the cache has died, overnight say, and `/clear` then `/handoff-load` starts from those notes for about a thousand tokens instead of re-reading the whole history at full price.
 - **A budget, if you want one.** Set `session_budget_usd` and you're told when a session, subagents included, passes it, and again at each multiple. Or have the message stopped once.
 - **A doctor for your setup.** It finds settings that silently break caching, adds up the CLAUDE.md files, imports, memory and rules loaded into every session, flags API keys and passwords sitting in them, and spots proxies that can rewrite your requests.
 - **Reports that explain the bill.** `report` lists every real cache miss with its likely cause and cost. `report --all` splits 30 days of spend by cause and subagents, tells you whether a 5-minute or 1-hour subagent cache would have been cheaper on your own history, and what the same work would have cost on Opus, Sonnet or Haiku.
@@ -36,7 +37,7 @@ There are other ways to attack the same problem. Each one gives up something cac
 | Sits between Claude Code and Anthropic | **No** | Yes, every request | No | No |
 | Sends requests that use your quota | **Only opt-in keep-warm, capped at the cost of one rebuild** | No | Yes, every ping | Some poll usage APIs |
 | Touches your Claude login token | **Never** | Every request passes through it | No | Some read it from your keychain |
-| Can change what Claude sees | **Only what you opt into** (Bash trimmer, Lean style, keep-warm pings) | Yes | Some add turns | No |
+| Can change what Claude sees | **Only what you opt into** (Bash trimmer, Lean style, keep-warm pings, handoff) | Yes | Some add turns | No |
 | Warns before cache-breaking moves | **Yes: model switch, cold `/compact`, cold message, resume** | No | Some, before a cold message | No |
 | Explains misses and their cost | **Yes, per miss and per cause** | Partly | No | Partly |
 | Keeps the cache warm while you're away | **Opt-in, only while it pays** | No | Yes, often by default | No |
@@ -47,9 +48,9 @@ There are other ways to attack the same problem. Each one gives up something cac
 
 - **No network.** cache-guard itself never makes a request; even keep-warm only asks Claude Code to take a turn. Everything comes from what Claude Code passes to the status line and the transcripts already on your disk.
 - **No proxy, no token.** It never sits in front of your API traffic and never reads your login credentials.
-- **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, the Lean output style changes how Claude writes its replies, and keep-warm wakes Claude for a one-word reply while you're away.
+- **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, the Lean output style changes how Claude writes its replies, keep-warm wakes Claude for a one-word reply while you're away, and the handoff asks Claude for its notes once while you're away. A handoff only reaches a new session when you run `/handoff-load`.
 - **Your settings, backed up.** Install backs up `settings.json`, keeps your own hooks, and uninstalls in one command.
-- **Readable.** One file, standard library only, with a 277-check test suite that runs against a throwaway home folder.
+- **Readable.** One file, standard library only, with a 303-check test suite that runs against a throwaway home folder.
 
 ## Install
 
@@ -80,9 +81,10 @@ Install copies the script to `~/.claude/cache-guard/`, backs up `~/.claude/setti
 | `--trim` | Trims huge Bash output (test and build logs) before Claude reads it |
 | `--notify` | Desktop alert when a warm cache is about to expire |
 | `--keepwarm` | Keeps a long session's cache warm while you're away (see Keep-warm below) |
+| `--handoff` | Saves a handoff before a long session's cache dies, and adds `/handoff-save` and `/handoff-load` (see Handoff below) |
 | `--lean` | Makes the bundled Lean output style your default |
 | `--all` | `--notify` and `--lean`. It never turns on the trimmer: only `--trim` does |
-| `--no-trim`, `--no-notify`, `--no-keepwarm` | Turn those back off |
+| `--no-trim`, `--no-notify`, `--no-keepwarm`, `--no-handoff` | Turn those back off |
 
 ## Reference
 
@@ -137,6 +139,7 @@ The tip is the most urgent of these:
 | Organization switch | The prompt cache belongs to one organization, and Claude can't use thinking written under another one. When you resume a session, or type into one, after signing in to a different organization, you're told what the next message re-reads and that the old thinking won't carry over, even if the cache was still warm. It follows `cold_prompt` (`warn`, `block` or `off`) and its cost floor. Only a hash of the organization ID is stored. With an API key or a cloud platform the signed-in organization isn't what runs the session, so this stays off. |
 | Subagent cost | When one subagent run costs at least `subagent_warn_usd` ($5) at list price, tells you what it cost and on which model, and, if it ran on Opus or Fable, how to make subagents cheaper (`CLAUDE_CODE_SUBAGENT_MODEL`, or a model in the agent's definition). An agent continued later is only mentioned again each time it passes another $5. |
 | Keep-warm (opt-in, `--keepwarm`) | A background Stop hook. After each of Claude's turns it waits quietly; if you haven't typed by shortly before the cache expires (`keepwarm_lead_minutes`, 5, before a 1h cache runs out; 1 minute before a 5m one), it wakes Claude with *reply with only: ok, no tools, no task*. That reply reads the cache, which resets its timer. It only pings when the rebuild would pass the cold-message floor, stops once the pings would add up to more than one rebuild (about 38 on a 1h Opus 5.5 cache, about 1.7 hours' worth on a 5m one; models without a price get a conservative cap) or after `keepwarm_max_hours` (12), with a 24-hour cap on top. It won't ping once the cache has gone cold, going by Claude Code's own expiry time (a Mac that slept through, a long final reply), or a session you closed. Any new turn cancels it: typing, a `/loop`, a scheduled task. Each ping is a full turn, so your other Stop hooks run after it too, and Claude Code may show its waiting-for-input notification. Near a usage limit (`keepwarm_limit_pct`, 95% used) it pings only when the limit resets at least 30 seconds before the cache expires, waiting until just after the reset; when the lockout would outlast the cache, it stands down. It goes by the newest reading from any open session, since limits are per account, and ignores a single model's limit when you're on a different model. On a subscription, a 5-minute cache usually means extra-usage credits, so it stands down there too (API-key sessions on a 5m cache, including ones behind a gateway with a spend limit, are still kept warm). Histories over `keepwarm_max_tokens` (700k) are left to Claude Code's idle compaction, which shrinks them while the cache is still warm. The status line shows `kept warm ×3` while it's working. Your Mac has to stay awake: run `caffeinate -i` while you're away. |
+| Handoff (opt-in, `--handoff`) | Keep-warm covers an hour or an afternoon; overnight the cache dies anyway, and coming back to a long session re-reads all of it at full price. With the handoff on, the first keep-warm ping after you've been away `handoff_after_minutes` (20) asks Claude for a handoff instead of `ok`: a reply that starts with `# cache-guard handoff`, then goal, state, decisions, open questions, next steps, and key files and commands, under 500 words. It reads the cache just like a ping, so it only adds the reply's output tokens. When that turn ends, the same Stop hook saves the reply to `~/.claude/cache-guard/handoffs/<session>.md`; Claude needs no file permission while you're away. `/handoff-save` asks for one on demand, before you leave for the day say, and is saved the same way. With keep-warm off, the handoff still works: one wake to write it, then the cache is left to expire. Nothing reaches a new session unless you ask: when you come back to a cold cache, the cold-message warning, the resume warning and the status-line tip say a handoff is saved and what each choice costs, and `/clear` then `/handoff-load` starts a fresh session from it. `/handoff-load` runs `cache_guard.py handoff-show`, which prints the newest handoff for the folder you're in, and asks Claude to check the files it names before relying on it. The status line shows `handoff 19:54` next to `kept warm ×N`. Histories over `keepwarm_max_tokens` are left to Claude Code's idle compaction here too. Install never overwrites a `/handoff-save` or `/handoff-load` command of your own. |
 | Bash trimmer (opt-in) | Output over 12,000 chars keeps its first 30 lines, last 60 lines and every error or warning line. The full log is saved to `~/.claude/cache-guard/logs/` and Claude is told where. Add `# no-trim` to a command to skip trimming. |
 
 The hooks only show messages to you. They never inject text into Claude's context, so they can't break the cache themselves. The one exception is opt-in keep-warm, whose ping asks Claude for a one-word reply.
@@ -195,6 +198,9 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `keepwarm_max_hours` | 12 | Stop keeping a session warm after this long away |
 | `keepwarm_limit_pct` | 95 | A usage limit this used: only ping if it resets before the cache expires |
 | `keepwarm_max_tokens` | 700000 | Larger histories are left to Claude Code's idle compaction |
+| `handoff` | false | Save a handoff before a long session's cache dies (`install --handoff` sets it and wires the hook) |
+| `handoff_after_minutes` | 20 | With keep-warm on, ask for the handoff at the first ping once you've been away this long |
+| `handoff_keep_days` | 30 | Delete saved handoffs older than this |
 | `pace_forecast` | true | Say when the recent pace uses a 5-hour limit up before it resets |
 | `pace_window_minutes` | 30 | How far back the pace is measured |
 | `resume_warn_tokens` | 50000 | Minimum history size for the resume warning |
@@ -228,7 +234,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ### Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 277 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 303 checks against a throwaway HOME
 ```
 
 ### Caveats

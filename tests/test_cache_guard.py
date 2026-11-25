@@ -348,7 +348,7 @@ def kw_state(sid, **kw):
     """Session state as the status line leaves it; keep-warm's own fields go in its own file."""
     st = {"ttl": "1h", "model_id": "claude-opus-5-5", "recache_tokens_if_cold": 337000, "updated": time.time(),
           "caching_observed": True}
-    own = {k: v for k, v in kw.items() if k.startswith("keepwarm_") or k == "last_prompt_at"}
+    own = {k: v for k, v in kw.items() if k.startswith(("keepwarm_", "handoff_")) or k == "last_prompt_at"}
     st.update({k: v for k, v in kw.items() if k not in own})
     KW_STATE.mkdir(parents=True, exist_ok=True)
     (KW_STATE / f"{sid}.json").write_text(json.dumps(st))
@@ -568,6 +568,136 @@ check("keepwarm: and the newest reading for every session in limits.json", glob.
 kw_state("kw12", keepwarm_pings=3, keepwarm_fired_at=time.time() - 5, last_prompt_at=t - 3600)
 rc, out, err = sl("kw12", prompt_cache=pc())
 check("keepwarm: the status line shows how many times it kept the cache warm", "kept warm ×3" in out.splitlines()[0], out)
+cfg_path.unlink()
+
+# ---------------- handoff before the cache dies
+HO_DIR = HOME / ".claude" / "cache-guard" / "handoffs"
+HO_TEXT = ("# cache-guard handoff\n## Goal\nShip the handoff feature.\n## State\nTests written.\n## Decisions\nUse the "
+           "first ping.\n## Open questions\nNone.\n## Next steps\n1. Implement.\n## Key files and commands\ncache_guard.py")
+
+
+def ho_transcript(name, reply, split=False):
+    tp = WORK / f"{name}.jsonl"
+    recs = [{"type": "user", "message": {"role": "user", "content": "earlier"}},
+            {"type": "assistant", "message": {"id": f"old-{name}", "role": "assistant",
+                                              "content": [{"type": "text", "text": "an earlier reply"}]}},
+            {"type": "user", "message": {"role": "user", "content": "cache-guard keep-warm ping with handoff ..."}}]
+    parts = [reply[:30], reply[30:]] if split else [reply]
+    for i, part in enumerate(parts):
+        recs.append({"type": "assistant", "uuid": f"{name}-{i}", "message": {
+            "id": f"msg-{name}", "role": "assistant", "content": [{"type": "text", "text": part}]}})
+    recs.append({"type": "system", "subtype": "turn_duration", "durationMs": 9000})
+    tp.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    return tp
+
+
+def capture(sid, tp, cwd=None, fresh=True):
+    if fresh:
+        kw_state(sid, ttl=None)  # no cache seen yet: the hook saves the handoff and returns without arming a timer
+    return run(["hook-keepwarm"], {"session_id": sid, "transcript_path": str(tp), "cwd": str(cwd or WORK),
+                                   "hook_event_name": "Stop"})
+
+
+def put_handoff(sid, cwd, at, body=HO_TEXT):
+    HO_DIR.mkdir(parents=True, exist_ok=True)
+    meta = {"session": sid, "cwd": str(cwd), "at": at, "model": "claude-opus-5-5", "history_tokens": 337000}
+    (HO_DIR / f"{sid}.md").write_text(f"<!-- cache-guard handoff {json.dumps(meta)} -->\n{body}\n")
+
+
+cfg_path.write_text(json.dumps({"keepwarm": True, "handoff": True, "handoff_after_minutes": 0,
+                                "keepwarm_lead_minutes": 1 / 60}))
+kw_state("ho1")
+rc, out, err = kw_wait(kw_start("ho1"))
+k = kw_get("ho1")
+check("handoff: the first ping of an away stretch asks for a handoff instead of ok",
+      rc == 2 and "keep-warm ping" in err and "# cache-guard handoff" in err and "Reply with only: ok" not in err
+      and k.get("handoff_stretch") == k.get("keepwarm_since") and k.get("keepwarm_pings") == 1, f"{rc} {err} {k}")
+t = time.time()
+kw_state("ho2", keepwarm_fired_at=t - 5, last_prompt_at=t - 3600, keepwarm_since=t - 3600, handoff_stretch=t - 3600)
+rc, out, err = kw_wait(kw_start("ho2"))
+check("handoff: later pings in the same stretch are plain ok pings", rc == 2 and "Reply with only: ok" in err
+      and "# cache-guard handoff" not in err, f"{rc} {err}")
+cfg_path.write_text(json.dumps({"keepwarm": True, "handoff": True, "handoff_after_minutes": 60,
+                                "keepwarm_lead_minutes": 1 / 60}))
+kw_state("ho3")
+rc, out, err = kw_wait(kw_start("ho3"))
+check("handoff: with keep-warm on it waits until you've been away handoff_after_minutes",
+      rc == 2 and "Reply with only: ok" in err and "# cache-guard handoff" not in err, f"{rc} {err}")
+cfg_path.write_text(json.dumps({"keepwarm": False, "handoff": True, "handoff_after_minutes": 60,
+                                "keepwarm_lead_minutes": 1 / 60}))
+kw_state("ho4")
+rc, out, err = kw_wait(kw_start("ho4"))
+check("handoff: with keep-warm off it asks at the one wake it gets", rc == 2 and "# cache-guard handoff" in err, f"{rc} {err}")
+t = time.time()
+kw_state("ho5", keepwarm_fired_at=t - 5, last_prompt_at=t - 3600, keepwarm_since=t - 3600, handoff_stretch=t - 3600)
+t0 = time.time()
+rc, out, err = kw_wait(kw_start("ho5"))
+check("handoff: with keep-warm off, once it's written the cache is left to expire", rc == 0 and not err.strip()
+      and not kw_get("ho5").get("keepwarm_pings"), f"{rc} {err}")
+
+cfg_path.write_text(json.dumps({"handoff": True}))
+rc, out, err = capture("hc1", ho_transcript("hc1", HO_TEXT))
+f = HO_DIR / "hc1.md"
+body = f.read_text() if f.exists() else ""
+meta = json.loads(body.split("\n", 1)[0][len("<!-- cache-guard handoff "):-len(" -->")]) if body.startswith("<!--") else {}
+check("handoff: the reply is saved from the transcript with where and when it was written",
+      rc == 0 and "## Goal\nShip the handoff feature." in body and "an earlier reply" not in body
+      and meta.get("session") == "hc1" and meta.get("cwd") == str(WORK) and meta.get("at"), body + err)
+first = kw_get("hc1").get("handoff_at")
+time.sleep(0.05)
+capture("hc1", WORK / "hc1.jsonl", fresh=False)
+check("handoff: the same reply isn't saved twice", first and kw_get("hc1").get("handoff_at") == first, json.dumps(kw_get("hc1")))
+rc, out, err = capture("hc2", ho_transcript("hc2", HO_TEXT, split=True))
+f = HO_DIR / "hc2.md"
+check("handoff: a reply split over several transcript records is saved whole",
+      f.exists() and "Ship the handoff feature." in f.read_text() and "# cache-guard handoff" in f.read_text(), err)
+rc, out, err = capture("hc5", ho_transcript("hc5", "Here it is:\n```markdown\n" + HO_TEXT + "\n```\n"))
+f = HO_DIR / "hc5.md"
+saved = f.read_text().split("\n", 1)[1] if f.exists() else ""
+check("handoff: a short preamble and a code fence around it are dropped", saved.startswith("# cache-guard handoff")
+      and "```" not in saved and "Here it is" not in saved, saved)
+rc, out, err = capture("hc3", ho_transcript("hc3", "Sure, here's a summary of where we are."))
+check("handoff: an ordinary reply is not a handoff", rc == 0 and not (HO_DIR / "hc3.md").exists(), err)
+cfg_path.write_text(json.dumps({"handoff": False}))
+rc, out, err = capture("hc4", ho_transcript("hc4", HO_TEXT))
+check("handoff: off means nothing is saved", rc == 0 and not (HO_DIR / "hc4.md").exists(), err)
+
+cfg_path.write_text(json.dumps({"handoff": True}))
+other, here = Path(tempfile.mkdtemp(prefix="cg-other-")), Path(tempfile.mkdtemp(prefix="cg-here-"))
+put_handoff("hs-old", here, time.time() - 7200, HO_TEXT.replace("Ship the handoff feature.", "the older one"))
+put_handoff("hs-new", here, time.time() - 60, HO_TEXT.replace("Ship the handoff feature.", "the newest one"))
+put_handoff("hs-elsewhere", other, time.time() - 10, HO_TEXT.replace("Ship the handoff feature.", "another folder"))
+rc, out, err = run(["handoff-show"], cwd=here)
+check("handoff-show: prints the newest handoff saved for this folder", rc == 0 and "the newest one" in out
+      and "the older one" not in out and "another folder" not in out and "1m ago" in out, out + err)
+rc, out, err = run(["handoff-show"], cwd=HOME)
+check("handoff-show: says so when this folder has none", rc == 0 and "No cache-guard handoff" in out, out + err)
+rc, out, err = run(["handoff-show", "hs-elsewh"], cwd=HOME)
+check("handoff-show: or prints the one for a session id", rc == 0 and "another folder" in out, out + err)
+
+sl("hp1", model=OPUS, prompt_cache=pc(**COLD))
+put_handoff("hp1", WORK, time.time() - 1800)
+rc, out, _ = run(["hook-prompt"], {"session_id": "hp1", "prompt": "carry on", "source": "user"})
+msg = (json.loads(out) if out.strip() else {}).get("systemMessage", "")
+check("handoff: the cold-message warning points to the saved handoff and what it costs to load",
+      "/handoff-load" in msg and "handoff from" in msg and "/clear" in msg and "180k" in msg, out)
+sl("hp2", model=OPUS, prompt_cache=pc(**COLD))
+put_handoff("hp2", WORK, time.time() - 1800)
+(KW_STATE / "hp2.keepwarm.json").write_text(json.dumps({"last_prompt_at": time.time() - 60}))
+rc, out, _ = run(["hook-prompt"], {"session_id": "hp2", "prompt": "carry on", "source": "user"})
+check("handoff: one older than your last message isn't offered", "/handoff-load" not in out, out)
+put_handoff("hp3", WORK, time.time() - 1800)
+rc, out, _ = sl("hp3", model=OPUS, prompt_cache=pc(**COLD))
+check("handoff: the cold status-line tip offers it", "/handoff-load" in out.splitlines()[-1], out)
+put_handoff("hr1", WORK, time.time() - 1800)
+rc, out, _ = run(["hook-session-start"], {"source": "resume", "session_id": "hr1", "context_tokens": 400000,
+                                           "prompt_cache_likely_expired": True})
+check("handoff: the cold resume warning offers it", "/handoff-load" in out and "400k" in out, out)
+kw_state("hk1", handoff_at=time.time() - 60, keepwarm_pings=2, keepwarm_fired_at=time.time() - 60,
+         last_prompt_at=time.time() - 7200, keepwarm_since=time.time() - 7200)
+rc, out, _ = sl("hk1", prompt_cache=pc())
+check("handoff: the status line shows when one was saved while you're away", "handoff " in out.splitlines()[0]
+      and "kept warm ×2" in out.splitlines()[0], out)
 cfg_path.unlink()
 
 # ---------------- model switch hook
@@ -1554,6 +1684,33 @@ check("install: --no-keepwarm removes it and keeps your own Stop hooks", "hook-k
       and "echo done" in json.dumps(s["hooks"]["Stop"]) and json.loads(cfg_path.read_text()).get("keepwarm") is False,
       json.dumps(s["hooks"]))
 
+CMDS = HOME / ".claude" / "commands"
+rc, out, err = run(["install", "--handoff"])
+s = json.loads(settings.read_text())
+c = json.loads(cfg_path.read_text())
+load_cmd = (CMDS / "handoff-load.md").read_text() if (CMDS / "handoff-load.md").exists() else ""
+save_cmd = (CMDS / "handoff-save.md").read_text() if (CMDS / "handoff-save.md").exists() else ""
+check("install: --handoff turns it on, wires the Stop hook even with keep-warm off, and adds the two commands",
+      rc == 0 and c.get("handoff") is True and c.get("keepwarm") is False and "hook-keepwarm" in json.dumps(s["hooks"])
+      and "handoff-show" in load_cmd and "allowed-tools" in load_cmd and str(HOME / ".claude" / "cache-guard") in load_cmd
+      and "# cache-guard handoff" in save_cmd and "handoff" in out, out + json.dumps(s["hooks"]))
+check("install: says keep-warm is still off", "· keep-warm" in out, out)
+rc, out, err = run(["install"])
+check("install: re-run keeps the handoff", json.loads(cfg_path.read_text()).get("handoff") is True
+      and (CMDS / "handoff-load.md").exists() and "hook-keepwarm" in settings.read_text(), out)
+rc, out, err = run(["install", "--no-handoff"])
+check("install: --no-handoff removes the commands and the Stop hook when keep-warm is off",
+      json.loads(cfg_path.read_text()).get("handoff") is False and not (CMDS / "handoff-load.md").exists()
+      and not (CMDS / "handoff-save.md").exists() and "hook-keepwarm" not in settings.read_text(), out)
+CMDS.mkdir(parents=True, exist_ok=True)
+(CMDS / "handoff-save.md").write_text("my own command\n")
+rc, out, err = run(["install", "--handoff"])
+check("install: never overwrites a command of yours with the same name",
+      (CMDS / "handoff-save.md").read_text() == "my own command\n" and "handoff-save.md" in out, out)
+run(["install", "--no-handoff"])
+check("install: and never removes it either", (CMDS / "handoff-save.md").read_text() == "my own command\n", "")
+(CMDS / "handoff-save.md").unlink()
+
 rc, out, err = run(["doctor"])
 check("doctor: runs", rc == 0, out + err)
 check("doctor: flags opusplan, forced 5m, injecting hook, big CLAUDE.md",
@@ -1609,8 +1766,11 @@ check("doctor: and is quiet about it once it is set", "CLAUDE_CODE_SUBAGENT_MODE
 check("doctor: a clean environment has no interceptor or secret warnings", rc == 0 and "preloads code" not in out
       and "looks like" not in out and "local proxy" not in out, out)
 
-run(["install", "--keepwarm"])
+run(["install", "--keepwarm", "--handoff"])
 rc, out, err = run(["uninstall"])
+check("uninstall: removes the handoff commands and turns it off for running sessions",
+      not (HOME / ".claude" / "commands" / "handoff-load.md").exists()
+      and json.loads(cfg_path.read_text()).get("handoff") is False, out)
 check("uninstall: turns keep-warm off for sessions still running the old hook",
       json.loads(cfg_path.read_text()).get("keepwarm") is False, cfg_path.read_text())
 s = json.loads(settings.read_text())
