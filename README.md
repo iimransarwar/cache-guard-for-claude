@@ -6,7 +6,7 @@ Every turn, Claude Code re-sends your whole conversation. Prompt caching bills t
 
 cache-guard tells you. It shows what the cache is saving you right under the input box, warns you before the moves that throw a warm cache away, forecasts when you'll hit your usage limit, can keep a long session warm while you're away, and finds the settings and files that waste tokens. One Python file. No dependencies, no network, no proxy, and its warnings go to you, never into Claude's conversation.
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 234](https://img.shields.io/badge/tests-234%20checks-2ea44f)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB) ![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea44f) ![Network: none](https://img.shields.io/badge/network-none-2ea44f) ![Tests: 277](https://img.shields.io/badge/tests-277%20checks-2ea44f)
 
 ```
 Opus 5.5 | cache 95% (warm, 39m left, ttl 1h) | cache cut $60.50 → $12.40 (-80%) · avoidable $1.90 | misses 1 | ctx 337k · $0.07/turn | All models: 42% left (5h, out in ~40m) · 82% left (week)
@@ -49,7 +49,7 @@ There are other ways to attack the same problem. Each one gives up something cac
 - **No proxy, no token.** It never sits in front of your API traffic and never reads your login credentials.
 - **Never in Claude's context.** Hooks only show messages to you, so cache-guard can't break the cache it's guarding. The exceptions are opt-ins you pick by name: the Bash trimmer shortens huge command output, the Lean output style changes how Claude writes its replies, and keep-warm wakes Claude for a one-word reply while you're away.
 - **Your settings, backed up.** Install backs up `settings.json`, keeps your own hooks, and uninstalls in one command.
-- **Readable.** One file, standard library only, with a 234-check test suite that runs against a throwaway home folder.
+- **Readable.** One file, standard library only, with a 277-check test suite that runs against a throwaway home folder.
 
 ## Install
 
@@ -120,18 +120,21 @@ The tip is the most urgent of these:
 3. At the current pace a usage limit runs out before it resets: says when, and how long before the reset.
 4. A usage limit over 80% used: names the limit, says how much is left and when it resets, and suggests avoiding expensive actions until then.
 5. The cause of a miss in the last 10 minutes.
-6. Context above 75% of the window: `/compact` at your next break. A history over `context_warn_tokens` (400k): `/clear` for a new task or `/compact` at your next break, with what each turn costs to re-read.
+6. Context above 75% of the window: a white-on-red `COMPACT SOON` badge says to `/compact` at your next break, before auto-compact fires mid-task. A history over `context_warn_tokens` (400k): `/clear` for a new task or `/compact` at your next break, with what each turn costs to re-read.
 7. Otherwise, a rotating tip from 26 do's and don'ts.
+
+**Colours**: the basic terminal yellow, green and cyan, and faint grey text, sit near 3:1 contrast on a white background, and faint grey is hard to read on a dark one too. By default (`theme`: `auto`) cache-guard uses mid-tone colours that read on light and dark backgrounds alike (3.7:1 to 4.5:1 on both) and prints secondary text in your terminal's own text colour. If your terminal is always light or always dark, set `theme` to `light` or `dark` for 4.5:1 or better. If it follows macOS's light and dark appearance, as Apple Terminal's default profile does, `system` picks between those two each time the line refreshes. `CACHE_GUARD_THEME` overrides the setting for one shell, a terminal that sets `COLORFGBG` is detected under `auto`, and `NO_COLOR` turns colour off. The `COMPACT SOON` badge brings its own red background, so it looks the same everywhere.
 
 ### Guards (hooks)
 
 | Hook | What it does |
 | - | - |
-| Model switch | When the cache is warm, asks first and shows how many tokens the switch re-reads. When it's cold, stays silent. |
+| Model switch | When the cache is warm, asks first and shows how many tokens the switch re-reads. When it's cold, stays silent. Either way, if the new model can't read the current model's thinking (Opus 5.5 can't read Fable 5.2's, for example), it says so: the new model works without that reasoning until you switch back. This uses the Claude API's table and stays quiet on Bedrock, Vertex and Foundry. |
 | `/compact` | When the cache is cold, a manual `/compact` is stopped once with the cost. Run it again within 2 minutes to go ahead. Auto-compaction is never touched. |
 | Cold message | When you type into a session whose cache has gone cold and whose history would cost at least `cold_prompt_warn_usd` ($0.50) to re-read, you get a warning. The floor is in dollars because 100k tokens costs very different amounts on Haiku and Opus; models without a price fall back to `cold_prompt_warn_tokens` (100k). The warning says how long the cache has been cold, how many tokens the message re-reads and what that costs at list price. For a new task, `/clear` first is far cheaper. The message itself goes through. Set `cold_prompt` to `block` to have it stopped once instead; you then send it again within 2 minutes to go ahead. Slash commands, loops, scheduled tasks and SDK prompts are never touched. |
 | Session budget (opt-in) | Set `session_budget_usd` and typed messages get a warning when the session's list-price cost (main conversation plus subagents) passes it, and again at 2×, 3× and so on. The status line adds `over $25 budget` in red. Set `session_budget_action` to `block` to have the message stopped once instead; send it again within 2 minutes to go ahead. If the cache is also cold, both warnings arrive as one message. It keeps working with `statusline_cost` off. |
 | Resume | Warns when a resume re-sends a big history after the cache has expired. |
+| Organization switch | The prompt cache belongs to one organization, and Claude can't use thinking written under another one. When you resume a session, or type into one, after signing in to a different organization, you're told what the next message re-reads and that the old thinking won't carry over, even if the cache was still warm. It follows `cold_prompt` (`warn`, `block` or `off`) and its cost floor. Only a hash of the organization ID is stored. With an API key or a cloud platform the signed-in organization isn't what runs the session, so this stays off. |
 | Subagent cost | When one subagent run costs at least `subagent_warn_usd` ($5) at list price, tells you what it cost and on which model, and, if it ran on Opus or Fable, how to make subagents cheaper (`CLAUDE_CODE_SUBAGENT_MODEL`, or a model in the agent's definition). An agent continued later is only mentioned again each time it passes another $5. |
 | Keep-warm (opt-in, `--keepwarm`) | A background Stop hook. After each of Claude's turns it waits quietly; if you haven't typed by shortly before the cache expires (`keepwarm_lead_minutes`, 5, before a 1h cache runs out; 1 minute before a 5m one), it wakes Claude with *reply with only: ok, no tools, no task*. That reply reads the cache, which resets its timer. It only pings when the rebuild would pass the cold-message floor, stops once the pings would add up to more than one rebuild (about 38 on a 1h Opus 5.5 cache, about 1.7 hours' worth on a 5m one; models without a price get a conservative cap) or after `keepwarm_max_hours` (12), with a 24-hour cap on top. It won't ping once the cache has gone cold, going by Claude Code's own expiry time (a Mac that slept through, a long final reply), or a session you closed. Any new turn cancels it: typing, a `/loop`, a scheduled task. Each ping is a full turn, so your other Stop hooks run after it too, and Claude Code may show its waiting-for-input notification. Near a usage limit (`keepwarm_limit_pct`, 95% used) it pings only when the limit resets at least 30 seconds before the cache expires, waiting until just after the reset; when the lockout would outlast the cache, it stands down. It goes by the newest reading from any open session, since limits are per account, and ignores a single model's limit when you're on a different model. On a subscription, a 5-minute cache usually means extra-usage credits, so it stands down there too (API-key sessions on a 5m cache, including ones behind a gateway with a spend limit, are still kept warm). Histories over `keepwarm_max_tokens` (700k) are left to Claude Code's idle compaction, which shrinks them while the cache is still warm. The status line shows `kept warm ×3` while it's working. Your Mac has to stay awake: run `caffeinate -i` while you're away. |
 | Bash trimmer (opt-in) | Output over 12,000 chars keeps its first 30 lines, last 60 lines and every error or warning line. The full log is saved to `~/.claude/cache-guard/logs/` and Claude is told where. Add `# no-trim` to a command to skip trimming. |
@@ -209,6 +212,7 @@ Thresholds live in `~/.claude/cache-guard/config.json`. Install adds new keys to
 | `totals_days` | 30 | Days of sessions the all-projects line covers |
 | `totals_refresh_minutes` | 10 | How old the all-projects figures may get before a background scan |
 | `avoidable_warn_pct` | 15 | Avoidable share of the session's cost (%) at which that figure turns yellow |
+| `theme` | auto | Colours: `auto` reads on light and dark backgrounds, `light` and `dark` give more contrast on that background, `system` follows macOS's light/dark appearance |
 | `trim.max_chars` | 12000 | Only trim output longer than this |
 | `trim.head_lines`, `trim.tail_lines` | 30, 60 | Lines kept at the start and end |
 | `trim.max_error_lines` | 80 | Most error lines kept from the middle |
@@ -224,7 +228,7 @@ rm -rf ~/.claude/cache-guard ~/.claude/output-styles/lean.md
 ### Tests
 
 ```bash
-python3 tests/test_cache_guard.py   # 234 checks against a throwaway HOME
+python3 tests/test_cache_guard.py   # 277 checks against a throwaway HOME
 ```
 
 ### Caveats

@@ -21,12 +21,14 @@ Commands
   uninstall           Remove cache-guard from settings.json.
 
 Hook entry points (wired by install; you never call these yourself)
-  hook-model-switch   PreModelSwitch: ask before a switch that throws away a warm cache.
+  hook-model-switch   PreModelSwitch: ask before a switch that throws away a warm cache, and say when the
+                      new model can't read the old one's thinking.
   hook-compact        PreCompact: a manual /compact on a COLD cache must be repeated to run.
   hook-prompt         UserPromptSubmit: a typed message into a big COLD session gets a warning with
                       what it will cost (stopped once instead with cold_prompt=block). Automated
                       prompts are never touched.
-  hook-session-start  SessionStart: warn when a resume re-sends a big, expired history.
+  hook-session-start  SessionStart: warn when a resume re-sends a big, expired history, or one from another
+                      organization (its cache and thinking don't carry over).
   hook-trim           PostToolUse (Bash): trim huge output, keep errors, save the full log.
   hook-subagent-stop  SubagentStop: tell you when one subagent run cost more than subagent_warn_usd.
   hook-keepwarm       Stop, in the background (opt-in): while you're away, wake Claude for a one-word reply just
@@ -49,7 +51,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.4.1"
+VERSION = "2.5.2"
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 GUARD_DIR = CLAUDE_DIR / "cache-guard"
@@ -91,6 +93,7 @@ DEFAULT_CONFIG = {
     "session_budget_action": "warn",  # warn = only tell you; block = stop the message once
     "session_budget_confirm_seconds": 120,
     "pricing": {},               # override or add list prices: {"model-id-prefix": [in, 5m, 1h, read, out]}
+    "theme": "auto",             # colours: auto (reads on light and dark), light, dark, or system (follow macOS)
     "statusline_cost": True,     # show session cost, avoidable cost and cache savings on the status line
     "avoidable_warn_pct": 15,    # colour the avoidable figure from this share of the session's cost
     "statusline_totals": True,   # show the all-projects row on the status line
@@ -127,8 +130,59 @@ PRICES = {
 }
 LARGE_PROMPT = {"claude-haiku-5-5": (100_000, 5)}  # prompts over this many tokens cost this many times more
 
-RED, YEL, GRN, CYN, DIM, BOLD, RST = (
-    "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[2m", "\033[1m", "\033[0m")
+# Colours as 256-colour codes: (red, yellow, green, cyan, secondary text); None = the terminal's own text colour.
+# The basic yellow, green and cyan, and faint text, sit near 3:1 contrast on a white background. "auto" uses
+# mid-tones that read on light and dark backgrounds alike (3.7:1 to 4.5:1 on both white and #1e1e1e) and keeps
+# secondary text in the terminal's own colour. "light" and "dark" reach 4.5:1 or better on their own background.
+PALETTES = {
+    "auto": (196, 166, 29, 31, None),
+    "light": (160, 130, 28, 24, 240),
+    "dark": (203, 214, 78, 80, 248),
+}
+
+
+def macos_appearance():
+    """'dark' or 'light' from macOS's appearance setting (it follows Auto, so it changes at night), or None."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, text=True, timeout=2)
+    except Exception:
+        return None
+    return "dark" if r.stdout.strip().lower() == "dark" else "light"
+
+
+def colour_theme():
+    """'light', 'dark' or 'auto': CACHE_GUARD_THEME, then "theme" in config.json, then the terminal's COLORFGBG."""
+    theme = os.environ.get("CACHE_GUARD_THEME", "")
+    if not theme:
+        try:
+            theme = json.loads(CONFIG_PATH.read_text()).get("theme") or ""
+        except Exception:
+            theme = ""
+    theme = str(theme).strip().lower()
+    if theme == "system":
+        theme = macos_appearance() or "auto"
+    if theme in ("light", "dark"):
+        return theme
+    bg = os.environ.get("COLORFGBG", "").split(";")[-1]
+    if bg.isdigit():
+        return "light" if int(bg) in (7, 15) else "dark"
+    return "auto"
+
+
+def colour_codes(theme):
+    if os.environ.get("NO_COLOR"):
+        return ("",) * 7
+    red, yel, grn, cyn, sub = PALETTES.get(theme, PALETTES["auto"])
+    code = lambda n: f"\033[38;5;{n}m" if n is not None else ""  # noqa: E731
+    return code(red), code(yel), code(grn), code(cyn), code(sub), "\033[1m", "\033[0m"
+
+
+# DIM is secondary text. It used to be faint, which is hard to read on light and dark backgrounds.
+RED, YEL, GRN, CYN, DIM, BOLD, RST = colour_codes(colour_theme())
+# A badge for warnings you must act on: bold white on red (5.4:1), carrying its own background so it reads anywhere.
+ALERT = "" if os.environ.get("NO_COLOR") else "\033[1;38;5;231;48;5;160m"
 
 # ------------------------------------------------------------------ tips
 TIPS = [
@@ -581,6 +635,7 @@ def cmd_statusline():
     cpct = context_pct(data)
     hot = [x for x in limits if x["used"] >= cfg["limit_warn_pct"]]
     hot_limit = max(hot, key=lambda x: x["used"]) if hot else None  # the one nearest to used up
+    label = f"{DIM}tip:{RST}"
 
     if not warm and pc.get("caching_observed", True):
         if int(now // 30) % 2 == 0:
@@ -622,9 +677,10 @@ def cmd_statusline():
             tip = "Last miss: thinking settings changed. Set thinking at session start, not mid-task."
         else:
             tip = f"Last miss cause: {c}. Run /usage for details."
-    elif cpct is not None and cpct >= cfg["context_warn_pct"] or ctx_txt.startswith(f" | {YEL}"):
-        if cpct is not None and cpct >= cfg["context_warn_pct"]:
-            tip = (f"{YEL}Context {cpct:.0f}% full.{RST} /compact at your next natural break, "
+    elif cpct is not None and cpct > cfg["context_warn_pct"] or ctx_txt.startswith(f" | {YEL}"):
+        if cpct is not None and cpct > cfg["context_warn_pct"]:
+            label = f"{ALERT} COMPACT SOON {RST}"
+            tip = (f"{BOLD}{RED}Context {cpct:.0f}% full.{RST} /compact at your next natural break, "
                    f"before auto-compact fires mid-task.")
         else:
             each = f" (~{fmt_usd(turn_usd)} at list price)" if turn_usd is not None else ""
@@ -632,19 +688,110 @@ def cmd_statusline():
                    f"Same task? /compact at your next break.")
     else:
         tip = rotating
-    print(f"{DIM}tip:{RST} {tip}")
+    print(f"{label} {tip}")
 
 
 # ------------------------------------------------------------------ hooks
+CLOUD_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+
+# Which models can read a model's thinking on the Claude API (Anthropic's preserved-thinking page, November 2026).
+# A block the current model can't read is dropped for that request, unbilled, and read again after a switch back.
+# Opus 4.8, Sonnet 5, Haiku 4.5 and earlier are not listed: every model reads their thinking.
+_T52, _T51 = {"fable-5-2", "mythos-5-2"}, {"fable-5-1", "mythos-5-1"}
+THINKING_READERS = {
+    "fable-5-2": _T52, "mythos-5-2": _T52,
+    "fable-5-1": _T52 | _T51, "mythos-5-1": _T52 | _T51,
+    "fable-5": _T52 | _T51 | {"fable-5", "mythos-5"}, "mythos-5": _T52 | _T51 | {"fable-5", "mythos-5"},
+    "opus-5-5": _T52 | _T51 | {"opus-5-5"},
+    "opus-5": _T52 | _T51 | {"opus-5-5", "opus-5", "fable-5", "mythos-5"},
+    "sonnet-5-5": _T52 | {"opus-5-5", "sonnet-5-5"},
+    "haiku-5-5": _T52 | {"opus-5-5", "sonnet-5-5", "haiku-5-5"},
+}
+EARLIER_MODEL = re.compile(r"^((opus|sonnet|haiku)-4(-\d+)?|sonnet-5|3(-\d+)?-(opus|sonnet|haiku)(-.*)?)$")
+
+
+def model_key(m):
+    """'claude-opus-5-5[1m]', 'Opus 5.5' -> 'opus-5-5'."""
+    s = re.sub(r"\[.*?\]", "", str(m or "")).strip().lower()
+    s = re.sub(r"[\s._]+", "-", re.sub(r"^claude-", "", s))
+    return re.sub(r"-\d{8}$", "", s)
+
+
+def pretty_model(key):
+    family, *version = key.split("-")
+    return f"{family.title()} {'.'.join(version)}".strip()
+
+
+def thinking_note(from_model, to_model):
+    """A sentence when to_model can't read from_model's thinking, else ''. Only for models the table knows."""
+    if any(os.environ.get(k) for k in CLOUD_ENV):
+        return ""  # Bedrock, Vertex and Foundry read a slightly different set
+    src, dst = model_key(from_model), model_key(to_model)
+    readers = THINKING_READERS.get(src)
+    if not readers or dst in readers or not (dst in THINKING_READERS or EARLIER_MODEL.match(dst)):
+        return ""
+    return (f"{pretty_model(dst)} can't read {pretty_model(src)}'s earlier thinking, so it works without that "
+            f"reasoning until you switch back.")
+
+
+def org_fingerprint():
+    """A short hash of the organization Claude Code is signed in to, or None when that isn't what the session runs
+    on (an API key, a cloud platform) or it can't be read. Only the hash is ever stored."""
+    if any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") + CLOUD_ENV):
+        return None
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    for path in ([Path(base) / ".claude.json"] if base else []) + [HOME / ".claude.json"]:
+        try:
+            org = (json.loads(path.read_text()).get("oauthAccount") or {}).get("organizationUuid")
+        except Exception:
+            continue
+        return hashlib.sha256(str(org).encode()).hexdigest()[:16] if org else None
+    return None
+
+
+ORG_SWITCH = ("you're signed in to a different organization than {when}. The prompt cache doesn't carry across "
+              "organizations, so {who} re-reads ~{size} tokens uncached{price}, and Claude can't use the thinking it "
+              "wrote there ({back}).")
+
+
+def org_switch_check(cfg, state, source, org):
+    """('warn' | 'block' | None, text) for the first typed message after signing in to another organization.
+    Records the organization either way: the old one's cache and thinking are no use here, whatever the TTL says."""
+    old = state.get("org")
+    if not org or old == org:
+        return None, None
+    state["org"] = org
+    mode = str(cfg.get("cold_prompt", "warn")).lower()
+    est = state.get("recache_tokens_if_cold")
+    if not old or mode == "off" or not est or not state.get("caching_observed", True):
+        return None, None
+    try:
+        usd, _ = cold_cost(cfg, state.get("model_id"), est, state.get("ttl"))
+        if not over_cold_floor(cfg, est, usd):
+            return None, None
+    except Exception:
+        return None, None
+    state["cold_ack_for"] = state.get("expires_at")  # one warning covers this re-read
+    what = ORG_SWITCH.format(when="earlier in this session", who="this message", size=fmt_tokens(est),
+                             price=f", about {fmt_usd(usd)} at API list price" if usd else "",
+                             back="it comes back if you switch back")
+    if mode == "block" and source == "user":
+        return "block", f"{what} New task? /clear first is far cheaper. Same task? Send it again to go ahead."
+    return "warn", f"{what} For a new task, /clear first is far cheaper."
+
+
 def hook_model_switch():
     data = read_stdin_json()
     state = load_state(data.get("session_id"))
     to_model = data.get("to_model") or data.get("model") or "the new model"
+    note = thinking_note(data.get("from_model") or state.get("model_id"), data.get("to_model") or data.get("model"))
     warm = data.get("prompt_cache_warm")  # newer Claude Code tells the hook directly
     if warm is None:
         warm = bool(state) and cache_is_warm(state)
-    if not warm:
-        return  # cold or unknown: the switch costs nothing extra
+    if not warm:  # cold or unknown: the switch costs nothing extra, but say if reasoning gets left behind
+        if note:
+            emit({"systemMessage": f"cache-guard: {note}"})
+        return
     est = data.get("context_tokens") or state.get("recache_tokens_if_cold")
     size = f"~{fmt_tokens(est)} tokens" if est else "your whole history"
     usd = data.get("estimated_cache_write_usd")
@@ -652,7 +799,8 @@ def hook_model_switch():
         size += f" (about {fmt_usd(usd)} at list price)"
     emit({
         "systemMessage": (f"cache-guard: your cache is warm. Switching to {to_model} re-reads "
-                          f"{size} uncached on the next turn. Better at a break between tasks."),
+                          f"{size} uncached on the next turn. {note + ' ' if note else ''}"
+                          f"Better at a break between tasks."),
         "hookSpecificOutput": {"hookEventName": "PreModelSwitch", "permissionDecision": "ask"},
     })
 
@@ -799,6 +947,37 @@ def keepwarm_allowance(cfg, model_id, tokens, ttl):
     return int(int(tokens) * write // ping) if ping > 0 else None
 
 
+KEEPWARM_SCAN_BYTES = 4_000_000  # more than this appended while you're away: treat it as a turn without reading it
+
+
+def transcript_turn_since(path, mark):
+    """True when a user or assistant record was appended after byte mark[0]: a turn with no typed prompt, such as a
+    scheduled task or a background agent finishing. Claude Code also writes notes of its own into an idle session
+    (away_summary a few minutes after a turn ends, turn_duration, titles); those are not turns. Moves mark[0] past
+    every complete line read, so a record caught half-written is read whole next time. A file that shrank was
+    rewritten, which counts as activity."""
+    try:
+        size = os.path.getsize(path)
+        if size < mark[0] or size - mark[0] > KEEPWARM_SCAN_BYTES:
+            return True
+        if size == mark[0]:
+            return False
+        with open(path, "rb") as f:
+            f.seek(mark[0])
+            data = f.read(size - mark[0])
+    except OSError:
+        return False
+    cut = data.rfind(b"\n") + 1
+    mark[0] += cut
+    for line in data[:cut].splitlines():
+        try:
+            if json.loads(line).get("type") in ("user", "assistant"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def hook_keepwarm():
     """Stop hook run in the background (async + asyncRewake). While the user stays away, exit 2 shortly before the
     cache expires so Claude Code wakes Claude with KEEPWARM_MSG; its one-word reply reads the cache and resets the TTL.
@@ -837,8 +1016,8 @@ def hook_keepwarm():
         return e
 
     def stood_down():
-        """A newer turn re-armed, any turn started (typed, loop, scheduled), the transcript grew (a turn with no
-        prompt), or the session closed (the status line stopped refreshing)."""
+        """A newer turn re-armed, any turn started (typed, loop, scheduled), the transcript gained a turn with no
+        prompt, or the session closed (the status line stopped refreshing)."""
         k = load_keepwarm(sid)
         if (k.get("keepwarm_armed") != token or float(k.get("last_prompt_at") or 0) > armed
                 or float(k.get("turn_at") or 0) > armed):
@@ -846,14 +1025,13 @@ def hook_keepwarm():
         if time.time() - float(load_state(sid).get("updated") or 0) > KEEPWARM_ALIVE:
             return True
         if transcript and time.time() - armed >= KEEPWARM_SETTLE:
-            try:
-                size = os.path.getsize(transcript)
-            except OSError:
-                return False
             if not baseline:
-                baseline.append(size)
-            elif size != baseline[0]:
-                return True
+                try:
+                    baseline.append(os.path.getsize(transcript))
+                except OSError:
+                    pass
+                return False
+            return transcript_turn_since(transcript, baseline)
         return False
 
     def ping_time():
@@ -1060,7 +1238,9 @@ def hook_prompt():
     if str(data.get("prompt") or "").lstrip().startswith("/"):
         return  # /clear and /compact are the way out, so never stand in front of a command
     before = json.dumps(state, sort_keys=True)
-    found = [r for r in (cold_prompt_check(cfg, state, source, now), budget_check(cfg, state, source, now)) if r[0]]
+    switched = org_switch_check(cfg, state, source, org_fingerprint())
+    cold = switched if switched[0] else cold_prompt_check(cfg, state, source, now)
+    found = [r for r in (cold, budget_check(cfg, state, source, now)) if r[0]]
     if json.dumps(state, sort_keys=True) != before:
         save_state(sid, state)
     if not found:
@@ -1112,8 +1292,15 @@ def hook_session_start():
     cleanup_old_files(cfg)
     if data.get("source") != "resume":
         return
+    sid = data.get("session_id")
+    state = load_state(sid) if sid else {}
+    org, old_org = org_fingerprint(), state.get("org")
+    if org and state and org != old_org:
+        state["org"] = org
+        save_state(sid, state)
+    switched = bool(org and old_org and org != old_org)
     tokens = data.get("context_tokens")
-    expired = data.get("prompt_cache_likely_expired")
+    expired = True if switched else data.get("prompt_cache_likely_expired")
     tpath = data.get("transcript_path")
     if tokens is None and tpath:
         tokens = last_context_tokens(tpath)
@@ -1126,6 +1313,12 @@ def hook_session_start():
         return
     usd = data.get("estimated_cache_write_usd")
     price = f" (about {fmt_usd(usd)} at list price)" if isinstance(usd, (int, float)) and usd > 0 else ""
+    if switched:
+        emit({"systemMessage": "cache-guard: " + ORG_SWITCH.format(
+            when="when this session last ran", who="your first message", size=fmt_tokens(tokens), price=price,
+            back="resume in that organization to get it back") + " Starting something new? /clear (or a fresh "
+            "session) is much cheaper."})
+        return
     emit({"systemMessage": (
         f"cache-guard: this resume re-sends ~{fmt_tokens(tokens)} tokens{price} and the cache has likely "
         f"expired, so your first message pays full price for all of it. If you're starting "

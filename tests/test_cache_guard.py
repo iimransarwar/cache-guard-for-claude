@@ -14,10 +14,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "cache_guard.py"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def fg(n):  # a 256-colour foreground code
+    return f"\x1b[38;5;{n}m"
+
+
+RED_, YEL_ = fg(196), fg(166)  # the default palette's red and yellow
 HOME = Path(tempfile.mkdtemp(prefix="cg-home-"))
 WORK = Path(tempfile.mkdtemp(prefix="cg-work-"))
 ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("BASH_MAX", "MAX_MCP", "NODE_OPTIONS", "NODE_EXTRA_CA",
-                                                                    "HTTPS_PROXY", "https_proxy", "ANTHROPIC_BASE_URL"))},
+                                                                    "HTTPS_PROXY", "https_proxy", "ANTHROPIC_BASE_URL",
+                                                                    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_",
+                                                                    "CLAUDE_CONFIG_DIR", "NO_COLOR", "COLORFGBG", "CACHE_GUARD_THEME",
+                                                                    "CLAUDE_CODE_SUBAGENT_MODEL"))},
        "HOME": str(HOME),
        "CACHE_GUARD_NO_SPAWN": "1"}  # status lines never start a background scan, except where a test turns it back on
 SPAWN_ENV = {k: v for k, v in ENV.items() if k != "CACHE_GUARD_NO_SPAWN"}
@@ -106,8 +116,8 @@ check("limits: a gateway spend limit never shows below 0% left", out.splitlines(
       and "Monthly spend limit used up: 0% left (resets " in out, out)
 rc, out, _ = sl("lim-7", raw=True, prompt_cache=pc(), rate_limits={"five_hour": {"used_percentage": 85, "resets_at": R},
                                                                    "seven_day_fable": {"used_percentage": 91, "resets_at": R + 86400}})
-check("limits: colours follow how much is used", "Fable: \x1b[31m9% left\x1b[0m" in out
-      and "All models: \x1b[33m15% left\x1b[0m" in out, repr(out))
+check("limits: colours follow how much is used", f"Fable: {RED_}9% left\x1b[0m" in out
+      and f"All models: {YEL_}15% left\x1b[0m" in out, repr(out))
 check("limits: the tip names the limit nearest to used up", "Weekly Fable limit nearly used up: 9% left (resets " in out, out)
 
 rc, out, _ = sl("d", prompt_cache=pc(), context_window={"used_percentage": 82})
@@ -449,9 +459,35 @@ kw_state("kw15", transcript_path=str(tp))
 p_ = kw_start("kw15")
 time.sleep(0.8)
 with open(tp, "a") as f:
-    f.write("{}\n")
+    f.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}) + "\n")
 rc, out, err = kw_wait(p_)
 check("keepwarm: a turn that writes the transcript without a prompt stands it down", rc == 0 and not err.strip(), f"{rc} {err}")
+tp = WORK / "kw15b.jsonl"
+tp.write_text("{}\n")
+kw_state("kw15b", transcript_path=str(tp))
+p_ = kw_start("kw15b")
+time.sleep(0.8)
+with open(tp, "a") as f:  # what Claude Code 2.1.332 writes on its own a few minutes after a turn ends
+    for rec in ({"type": "system", "subtype": "away_summary", "content": "While you were away: ...", "isMeta": True},
+                {"type": "system", "subtype": "turn_duration", "durationMs": 70000}, {"type": "summary", "summary": "x"},
+                {"type": "custom-title", "customTitle": "x"}):
+        f.write(json.dumps(rec) + "\n")
+rc, out, err = kw_wait(p_)
+check("keepwarm: Claude Code's own idle notes (away_summary and the like) are not turns, so it still pings",
+      rc == 2 and "keep-warm ping" in err, f"{rc} {err}")
+tp = WORK / "kw15c.jsonl"
+tp.write_text("{}\n")
+kw_state("kw15c", transcript_path=str(tp))
+p_ = kw_start("kw15c")
+line = json.dumps({"type": "user", "message": {"role": "user", "content": "scheduled task"}}) + "\n"
+time.sleep(0.6)
+with open(tp, "a") as f:
+    f.write(line[:20])  # caught half-written: the next look must still see the whole record
+time.sleep(0.3)
+with open(tp, "a") as f:
+    f.write(line[20:])
+rc, out, err = kw_wait(p_)
+check("keepwarm: a turn record caught half-written still stands it down", rc == 0 and not err.strip(), f"{rc} {err}")
 kw_state("kw16", expires_at=time.time() + 1.6)
 t0 = time.time()
 rc, out, err = kw_wait(kw_start("kw16"))
@@ -605,6 +641,157 @@ transcript.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 os.utime(transcript, (NOW - 7200, NOW - 7200))
 rc, out, _ = run(["hook-session-start"], {"source": "resume", "transcript_path": str(transcript)})
 check("resume: transcript fallback estimates size", "60k" in out, out)
+
+# ---------------- colours: readable on white and on dark backgrounds
+saved_cfg = cfg_path.read_text() if cfg_path.exists() else None
+if cfg_path.exists():
+    cfg_path.unlink()
+BIG = pc(recache_tokens_if_cold=520000)  # a yellow size warning with a plain "tip:" label
+rc, out, _ = sl("col-1", raw=True, model=OPUS, prompt_cache=BIG)
+check("colours: no faint text and none of the basic yellow, green or cyan by default",
+      not any(c in out for c in ("\x1b[2m", "\x1b[33m", "\x1b[32m", "\x1b[36m")) and YEL_ in out, repr(out))
+check("colours: by default secondary text keeps the terminal's own colour", "\ntip:\x1b[0m " in out, repr(out))
+rc, out, _ = sl("col-1", raw=True, prompt_cache=pc(**COLD))
+check("colours: the default red is the mid-tone one", f"{RED_}\x1b[1mCOLD" in out, repr(out))
+for how, env_extra, cfg_extra, yel, sub_ in (
+        ("CACHE_GUARD_THEME=light", {"CACHE_GUARD_THEME": "light"}, None, 130, 240),
+        ("\"theme\": \"dark\" in config.json", {}, {"theme": "dark"}, 214, 248),
+        ("COLORFGBG naming a white background", {"COLORFGBG": "0;15"}, None, 130, 240),
+        ("COLORFGBG naming a black background", {"COLORFGBG": "15;0"}, None, 214, 248),
+        ("CACHE_GUARD_THEME over config.json", {"CACHE_GUARD_THEME": "light"}, {"theme": "dark"}, 130, 240)):
+    if cfg_extra:
+        cfg_path.write_text(json.dumps(cfg_extra))
+    rc, out, _ = sl("col-1", raw=True, env={**ENV, **env_extra}, model=OPUS, prompt_cache=BIG)
+    check(f"colours: {how} picks the matching palette, secondary text included",
+          fg(yel) in out and f"{fg(sub_)}tip:" in out, repr(out))
+    if cfg_extra:
+        cfg_path.unlink()
+ALERT_ = "\x1b[1;38;5;231;48;5;160m"
+rc, out, _ = sl("col-2", raw=True, prompt_cache=pc(), context_window={"used_percentage": 90})
+tip_line = out.splitlines()[-1]
+check("colours: near auto-compact the tip becomes a white-on-red COMPACT SOON badge with a bold red headline",
+      tip_line.startswith(f"{ALERT_} COMPACT SOON \x1b[0m ") and f"\x1b[1m{RED_}Context 90% full.\x1b[0m" in tip_line
+      and "/compact" in tip_line, repr(out))
+rc, out, _ = sl("col-2", raw=True, env={**ENV, "CACHE_GUARD_THEME": "dark"}, prompt_cache=pc(),
+                context_window={"used_percentage": 90})
+check("colours: the badge looks the same on every theme, since it brings its own background", ALERT_ in out, repr(out))
+rc, out, _ = sl("col-2", raw=True, prompt_cache=pc(), context_window={"used_percentage": 60})
+check("colours: below context_warn_pct there is no badge", "COMPACT SOON" not in out and ALERT_ not in out, repr(out))
+rc, out, _ = sl("col-2", prompt_cache=pc(), context_window={"used_percentage": 75})
+check("colours: exactly at context_warn_pct (75) is not above it: no badge", "COMPACT SOON" not in out, out)
+rc, out, _ = sl("col-2", prompt_cache=pc(), context_window={"used_percentage": 75.5})
+check("colours: just above context_warn_pct the badge shows", "COMPACT SOON" in out, out)
+rc, out, _ = sl("col-2", raw=True, env={**ENV, "NO_COLOR": "1"}, prompt_cache=pc(), context_window={"used_percentage": 90})
+check("colours: with NO_COLOR the badge is still spelled out", "COMPACT SOON" in out and "\x1b[" not in out, repr(out))
+rc, out, _ = sl("col-1", raw=True, env={**ENV, "NO_COLOR": "1"}, prompt_cache=pc(**COLD))
+check("colours: NO_COLOR turns every colour off", rc == 0 and "\x1b[" not in out and "(COLD, ttl 1h)" in out, repr(out))
+for appearance, want in (("dark", "dark"), ("light", "light"), (None, "auto")):
+    p = subprocess.run([sys.executable, "-B", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import cache_guard as cg; "
+                        f"cg.macos_appearance = lambda: {appearance!r}; print(cg.colour_theme())", str(ROOT)],
+                       capture_output=True, text=True, env={**ENV, "CACHE_GUARD_THEME": "system"})
+    check(f"colours: theme system follows macOS ({appearance} -> {want})", p.stdout.strip() == want, p.stdout + p.stderr)
+
+# ---------------- signing in to another organization
+CJ = HOME / ".claude.json"
+
+
+def sign_in(org):
+    CJ.write_text(json.dumps({"oauthAccount": {"organizationUuid": org, "organizationName": "Test org"}}))
+
+
+def prompt(sid, text="carry on", env=None):
+    rc, out, _ = run(["hook-prompt"], {"session_id": sid, "prompt": text, "source": "user"}, env=env)
+    return rc, out, (json.loads(out) if out.strip() else {})
+
+
+sign_in("org-aaaa-1111")
+sl("org-1", model=OPUS, prompt_cache=pc())
+rc, out, j = prompt("org-1", "hello")
+check("org switch: the first typed message records the organization quietly", rc == 0 and out.strip() == "", out)
+st = json.loads((HOME / ".claude" / "cache-guard" / "state" / "org-1.json").read_text())
+check("org switch: stores a fingerprint, never the organization id", st.get("org") and "org-aaaa" not in json.dumps(st),
+      json.dumps(st))
+sign_in("org-bbbb-2222")
+rc, out, j = prompt("org-1", "/compact")
+check("org switch: a slash command is left alone", out.strip() == "", out)
+rc, out, j = prompt("org-1")
+msg = j.get("systemMessage", "")
+check("org switch: a warm cache from the old organization still warns, with size, cost and the lost thinking",
+      "decision" not in j and all(s in msg for s in ("different organization", "180k", "$1.44", "thinking", "/clear")), out)
+rc, out, j = prompt("org-1")
+check("org switch: warns once", out.strip() == "", out)
+cfg_path.write_text(json.dumps({"cold_prompt": "block"}))
+sign_in("org-aaaa-1111")
+rc, out, j = prompt("org-1")
+check("org switch: cold_prompt=block stops the first typed message once",
+      j.get("decision") == "block" and "different organization" in j.get("reason", "") and "again" in j.get("reason", ""), out)
+rc, out, j = prompt("org-1")
+check("org switch: sending it again goes ahead", out.strip() == "", out)
+cfg_path.write_text(json.dumps({"cold_prompt": "off"}))
+sign_in("org-bbbb-2222")
+rc, out, j = prompt("org-1")
+check("org switch: cold_prompt=off stays quiet", out.strip() == "", out)
+cfg_path.unlink()
+sign_in("org-aaaa-1111")
+rc, out, j = prompt("org-1", env={**ENV, "ANTHROPIC_API_KEY": "test-key"})
+check("org switch: with an API key the signed-in organization isn't what bills, so it stays quiet", out.strip() == "", out)
+CJ.write_text("{}")
+rc, out, j = prompt("org-1")
+check("org switch: not signed in at all is quiet", out.strip() == "", out)
+sl("org-3", model=OPUS, prompt_cache=pc(recache_tokens_if_cold=9000))
+sign_in("org-aaaa-1111")
+prompt("org-3", "hello")
+sign_in("org-bbbb-2222")
+rc, out, j = prompt("org-3")
+check("org switch: a small history isn't worth a warning", out.strip() == "", out)
+
+sign_in("org-aaaa-1111")
+sl("org-2", model=OPUS, prompt_cache=pc())
+prompt("org-2", "hello")
+sign_in("org-bbbb-2222")
+rc, out, _ = run(["hook-session-start"], {"source": "resume", "session_id": "org-2", "context_tokens": 400000,
+                                           "prompt_cache_likely_expired": False})
+check("org switch: resuming under another organization warns even when the cache looks warm",
+      all(s in out for s in ("different organization", "400k", "thinking", "/clear")), out)
+rc, out, j = prompt("org-2")
+check("org switch: and the first message after that resume isn't warned twice", out.strip() == "", out)
+rc, out, _ = run(["hook-session-start"], {"source": "resume", "session_id": "org-2", "context_tokens": 400000,
+                                           "prompt_cache_likely_expired": False})
+check("org switch: resuming again in the same organization is silent", out.strip() == "", out)
+CJ.unlink()
+
+# ---------------- model switch: thinking the new model can't read
+FABLE = {"display_name": "Fable 5.2", "id": "claude-fable-5-2"}
+sl("ms-1", model=FABLE, prompt_cache=pc())
+rc, out, _ = run(["hook-model-switch"], {"session_id": "ms-1", "to_model": "claude-opus-5-5"})
+j = json.loads(out) if out.strip() else {}
+msg = j.get("systemMessage", "")
+check("model switch: says when the new model can't read the old model's thinking",
+      j.get("hookSpecificOutput", {}).get("permissionDecision") == "ask"
+      and all(s in msg for s in ("180k", "Opus 5.5 can't read Fable 5.2's earlier thinking", "switch back")), out)
+sl("ms-2", model=FABLE, prompt_cache=pc(**COLD))
+rc, out, _ = run(["hook-model-switch"], {"session_id": "ms-2", "to_model": "claude-opus-5-5[1m]"})
+j = json.loads(out) if out.strip() else {}
+check("model switch: a cold switch that loses thinking is mentioned, not stopped",
+      "hookSpecificOutput" not in j and "can't read Fable 5.2's earlier thinking" in j.get("systemMessage", ""), out)
+rc, out, _ = run(["hook-model-switch"], {"session_id": "ms-2", "to_model": "claude-opus-5-5"},
+                 env={**ENV, "CLAUDE_CODE_USE_BEDROCK": "1"})
+check("model switch: no thinking note off the Claude API, where the table differs", out.strip() == "", out)
+sl("ms-3", model=OPUS, prompt_cache=pc())
+rc, out, _ = run(["hook-model-switch"], {"session_id": "ms-3", "to_model": "claude-fable-5-2"})
+check("model switch: no thinking note when the new model reads the old one's thinking",
+      "ask" in out and "can't read" not in out, out)
+for frm, to in (("claude-sonnet-5", "claude-opus-5-5"), ("claude-fable-5-2", "opus"),
+                ("claude-fable-5-2", "claude-fable-5-2[1m]"), ("claude-opus-5-5", "claude-fable-5-1")):
+    sl("ms-4", model={"display_name": "x", "id": frm}, prompt_cache=pc(**COLD))
+    rc, out, _ = run(["hook-model-switch"], {"session_id": "ms-4", "to_model": to})
+    check(f"model switch: cold {frm} -> {to} says nothing", rc == 0 and out.strip() == "", out)
+sl("ms-5", model={"display_name": "Sonnet 5.5", "id": "claude-sonnet-5-5"}, prompt_cache=pc(**COLD))
+rc, out, _ = run(["hook-model-switch"], {"session_id": "ms-5", "to_model": "claude-opus-4-8"})
+check("model switch: moving to an earlier model loses the newer model's thinking",
+      "Opus 4.8 can't read Sonnet 5.5's earlier thinking" in out, out)
+if saved_cfg is not None:
+    cfg_path.write_text(saved_cfg)
 
 # ---------------- report
 rc, out, err = run(["report"])
@@ -965,10 +1152,10 @@ check("statusline cost: and then the new ones", agrees(money(out), ref5) and mon
 # colour, zero avoidable, unpriced, switched off, errors
 cfg_path.write_text(json.dumps({"avoidable_warn_pct": 1}))
 rc, out, _ = cost_sl("cost-1", p1, raw=True)
-check("statusline cost: avoidable turns yellow above avoidable_warn_pct", "\x1b[33mavoidable $" in out, repr(out))
+check("statusline cost: avoidable turns yellow above avoidable_warn_pct", f"{YEL_}avoidable $" in out, repr(out))
 cfg_path.write_text(json.dumps({"avoidable_warn_pct": 99}))
 rc, out, _ = cost_sl("cost-1", p1, raw=True)
-check("statusline cost: and stays plain below it", " avoidable $" in out and "\x1b[33mavoidable" not in out, repr(out))
+check("statusline cost: and stays plain below it", " avoidable $" in out and f"{YEL_}avoidable" not in out, repr(out))
 cfg_path.unlink()
 
 warm_only = b"".join(line(resp(f"w{k}", NOW - 3000 + 30 * k, O, 30000 if k == 0 else 1000, 0 if k == 0 else 29000 + 1000 * k))
