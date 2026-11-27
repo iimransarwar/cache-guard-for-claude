@@ -54,7 +54,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
 GUARD_DIR = CLAUDE_DIR / "cache-guard"
@@ -680,6 +680,10 @@ def cmd_statusline():
         when = f" (resets {fmt_clock(hot_limit['reset'])})" if hot_limit["reset"] else ""
         tip = (f"{YEL}{limit_name(hot_limit)} {'used up' if left == '0' else 'nearly used up'}: {left}% left{when}.{RST} "
                f"Avoid resumes, model switches and cold /compact until then.")
+        # A context nearly full still needs saying: both warnings share the line, the limit first.
+        if cpct is not None and cpct > cfg["context_warn_pct"]:
+            label = f"{ALERT} COMPACT SOON {RST}"
+            tip += f" {BOLD}{RED}Context {cpct:.0f}% full:{RST} /compact at your next break."
     elif recent_miss and causes:
         c = causes[0]
         if c in CAUSE_TIPS:
